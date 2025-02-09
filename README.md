@@ -48,10 +48,11 @@ ollama pull gemma2:2b
 A sample command to run your **search session**:
 
 ```bash
-python main.py --query "Quantum computing in healthcare" \
+python main.py --query "Create a structure bouldering gym workout to push my climbing from v4 to v6" --web_search --max_depth 2 --device cpu --retrieval_model colpali 
                --web_search \
                --max_depth 2 \
                --device cpu \
+               --top_k 10 \
                --retrieval_model colpali
 ```
 
