@@ -1,6 +1,6 @@
 # NanoSage 🧙: Advanced Recursive Search & Report Generation  
 
-Deep Researchc assistant that runs on your laptop, using tiny models. - all open source!
+Deep Research assistant that runs on your laptop, using tiny models. - all open source!
 
 This document provides a **cleanly structured overview** of your **multi-modal**, **relevance‐aware**, **recursive search session** pipeline. It explains how the system enhances a user query, builds a knowledge base from local and web data, recursively explores subqueries (tracking the search hierarchy via a **Table of Contents**, TOC), **ranks each branch’s relevance** to avoid unrelated topics, and finally **generates a detailed report** using retrieval-augmented generation (RAG).
 
