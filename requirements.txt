@@ -1,0 +1,17 @@
+# Core Dependencies
+torch
+transformers
+sentence-transformers
+numpy
+pyyaml
+
+# Web and Parsing
+aiohttp
+duckduckgo_search
+beautifulsoup4
+pymupdf  # PyMuPDF for PDF handling
+pytesseract
+Pillow   # for image handling
+
+# Optional LLM Integration
+ollama
