@@ -36,6 +36,7 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 
 ```bash
 curl -fsSL https://ollama.com/install.sh | sh
+pip install --upgrade ollama
 ```
 *(Windows users: see [ollama.com](https://ollama.com) for installer.)*
 
