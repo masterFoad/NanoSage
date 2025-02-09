@@ -2,7 +2,7 @@
 
 Deep Research assistant that runs on your laptop, using tiny models. - all open source!
 
-# How is NanoSage different that other Assistant Researchers?
+## How is NanoSage different that other Assistant Researchers?
 
 It offers a structured breakdown of a multi-source, relevance-driven, recursive search pipeline. It walks through how the system refines a user query, builds a knowledge base from local and web data, and dynamically explores subqueries—tracking progress through a Table of Contents (TOC).
 
