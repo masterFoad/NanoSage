@@ -253,3 +253,20 @@ main.py:
               ├── rag_final_answer() → call_gemma()
               └── aggregate_results() → saves Markdown
 ```
+
+
+If you found **NanoSage** useful for your research or project - or saved you 1 minute of googling, please consider citing it:  
+
+**BibTeX Citation:**  
+```bibtex
+@misc{NanoSage,
+  author = {Foad Abo Dahood}, 
+  title = {NanoSage: A Recursive, Relevance-Driven Search and RAG Pipeline},
+  year = {2025},
+  howpublished = {\url{https://github.com/masterFoad/NanoSage}},
+  note = {Accessed: \today}
+}
+```
+
+**APA Citation:**  
+Foad, Abo Dahood. (2025). *NanoSage: A Recursive, Relevance-Driven Search and RAG Pipeline*. Retrieved from [https://github.com/masterFoad/NanoSage](https://github.com/masterFoad/NanoSage) 
