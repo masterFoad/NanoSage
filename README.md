@@ -1,101 +1,218 @@
-# NanoSage: Advanced Search Session and Report Generation Pipeline (With Relevance Filtering)
+# NanoSage 🧙: Advanced Recursive Search & Report Generation  
 
-This document describes the algorithm for our multi-modal, **relevance-aware**, recursive search session pipeline. The system enhances a user query, builds a knowledge base from local and web data, recursively explores subqueries (tracking the search hierarchy via a Table of Contents, TOC), **ranks each branch’s relevance** to avoid diving into unrelated topics, and finally generates a detailed report using retrieval-augmented generation (RAG).
+Deep Researchc assistant that runs on your laptop, using tiny models. - all open source!
 
-## 1. Initialization and Setup
+This document provides a **cleanly structured overview** of your **multi-modal**, **relevance‐aware**, **recursive search session** pipeline. It explains how the system enhances a user query, builds a knowledge base from local and web data, recursively explores subqueries (tracking the search hierarchy via a **Table of Contents**, TOC), **ranks each branch’s relevance** to avoid unrelated topics, and finally **generates a detailed report** using retrieval-augmented generation (RAG).
 
-1. **Input Parameters:**
+---
 
-   - User Query (e.g., `"Quantum computing in healthcare"`)
-   - Optional parameters (in `main.py`):
-     ```
-     --corpus_dir
-     --device
-     --retrieval_model
-     --top_k
-     --web_search
-     --personality
-     --rag_model
-     --max_depth
-     ```
-   - YAML Config (e.g. `"results_base_dir"`, `"max_query_length"`, `"web_search_limit"`, `"min_relevance"`)
+## Quick Start Guide  
 
-2. **Configuration Loading:**
+### 1. Install Dependencies
 
-   - `load_config(config_path)` (in `main.py`) loads the YAML configuration file.
-     - **`"min_relevance"`** is used to determine the cutoff below which subqueries are considered off-topic.
+1. Ensure **Python 3.8+** is installed.  
+2. Install required packages:
 
-3. **Session Initialization:**
-   - A `SearchSession` object is created in `main.py`, passing in the user query, config, etc.
-   - Within `SearchSession.__init__()` (in `search_session.py`):
-     - A unique `query_id` is generated, and `base_result_dir` is created.
-     - The original query is **enhanced** via `chain_of_thought_query_enhancement(query, personality)`.
-     - A retrieval model is loaded using `load_retrieval_model(retrieval_model, device)` from `knowledge_base.py`.
-     - **`embed_text()`** is used on the **enhanced query** to get a **reference embedding** for relevance checking.
-     - If a local corpus directory is provided, documents are loaded with `load_corpus_from_dir()` and added to the knowledge base (`KnowledgeBase.add_documents()`).
+```bash
+pip install -r requirements.txt
+```
 
-## 2. Query Expansion and Recursive Web Search
+3. *(Optional)* For GPU acceleration, install PyTorch with CUDA:
 
-1. **Subquery Generation:**
+```bash
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+```
+*(Replace `cu118` with your CUDA version.)*
 
-   - The **enhanced query** is cleaned with `clean_search_query(query)` and split into smaller subqueries using `split_query(query, max_len)`.
+---
 
-2. **Recursive Web Search with TOC Tracking & Relevance Scoring:**
-   - If `web_search_enabled` is true, `SearchSession.run_session()` calls `perform_recursive_web_searches(subqueries, current_depth=1)`.
-   - **For each subquery**:
-     - A **`TOCNode`** is created to represent this branch, storing:
-       - `query_text` (the subquery)
-       - `depth` (current recursion level)
-       - **`relevance_score`**: computed by comparing the subquery’s embedding to the **enhanced query embedding** via `late_interaction_score()`.
-         - If `relevance_score < min_relevance`, the branch is skipped (no web search or deeper subqueries).
-       - If above the relevance threshold:
-         - A sanitized directory is created (e.g. `web_<subquery>`) via `sanitize_filename()`.
-         - **Web results** are downloaded (`download_webpages_ddg()`), parsed (`parse_html_to_text()`), and embedded.
-         - **Branch Summaries** are generated with `summarize_text()`.
-         - If `current_depth < max_depth`, the system can generate **additional subqueries** (via `chain_of_thought_query_enhancement()`) and recurse further.
-   - This process produces a hierarchical **TOC** structure of relevant branches and their summaries.
+### 2. Set Up Ollama & Pull the Gemma Model
 
-## 3. Local Retrieval and Summarization
+1. **Install Ollama**:
 
-1. **Aggregating the Knowledge Base:**
-   - All downloaded web entries plus any local documents are merged into the knowledge base.
-2. **Local Retrieval:**
-   - `KnowledgeBase.search(enhanced_query, top_k)` finds the most relevant documents (via `retrieve()`).
-3. **Summarization:**
-   - Both **web results** and **local results** are summarized with `summarize_text()`.
-   - The final aggregated data is then used to generate a **detailed report**.
+```bash
+curl -fsSL https://ollama.com/install.sh | sh
+```
+*(Windows users: see [ollama.com](https://ollama.com) for installer.)*
 
-## 4. Retrieval-Augmented Generation (RAG) and Report Generation
+2. **Pull Gemma 2B** (for RAG-based summaries):
 
-1. **Aggregation Prompt Construction:**
+```bash
+ollama pull gemma2:2b
+```
 
-   - A final prompt is built in `_build_final_answer()`, including:
-     - The **enhanced query**.
-     - **A Table of Contents string** built from the TOC nodes (`build_toc_string(toc_tree)`) showing each subquery, depth, and short summary.
-     - Summaries of web and local findings.
-   - The prompt instructs the system to produce a **long**, multi-section, properly cited Markdown report.
+---
 
-2. **Final Answer Generation:**
+### 3. Run a Simple Search Query
 
-   - `rag_final_answer(aggregation_prompt, rag_model, personality)` calls `call_gemma()` to produce a **comprehensive** advanced report.
+A sample command to run your **search session**:
 
-3. **Report Saving:**
-   - The final answer, along with all aggregated data, is saved in a Markdown file via `aggregate_results(...)` (in `aggregator.py`), under the `results_base_dir/<query_id>/` folder.
+```bash
+python main.py --query "Quantum computing in healthcare" \
+               --web_search \
+               --max_depth 2 \
+               --device cpu \
+               --retrieval_model colpali
+```
 
-## 5. Balancing Exploration and Exploitation
+**Parameters**:
+- `--query`: Main search query (natural language).
+- `--web_search`: Enables web-based retrieval.
+- `--max_depth`: Recursion depth for subqueries (2 levels).
+- `--device cpu`: Uses CPU (swap with `cuda` for GPU).
+- `--retrieval_model colpali`: Uses **ColPali** for retrieval (try `all-minilm` for lighter model).
 
-By **comparing each subquery’s embedding** to the main query embedding, we:
+---
 
-- **Explore** new subtopics that pass the minimum relevance threshold (`relevance_score >= min_relevance`).
-- **Skip** potential rabbit holes if a subquery’s relevance falls below the threshold, preventing expansion into off-topic searches.
+### 4. Check Results & Report
 
-## 6. Final Output
+A **detailed Markdown report** will appear in `results/<query_id>/`.
 
-- The pipeline outputs a **Markdown report** summarizing the relevant subqueries, local documents, and a thoroughly generated final text via RAG. The path to this report is printed by `main.py`.
+**Example**:
+```
+results/
+└── 389380e2/
+    ├── Quantum_computing_in_healthcare_output.md
+    ├── web_Quantum_computing/
+    ├── web_results/
+    └── local_results/
+```
+
+Open the `*_output.md` file (e.g., `Quantum_computing_in_healthcare_output.md`) in a Markdown viewer (VSCode, Obsidian, etc.).
+
+---
+
+### 5. Advanced Options
+
+#### ✅ Using Local Files
+
+If you have local PDFs, text files, or images:
+
+```bash
+python main.py --query "AI in finance" \
+               --corpus_dir "my_local_data/" \
+               --top_k 5 \
+               --device cpu
+```
+
+Now the system searches **both** local docs and web data (if `--web_search` is enabled).
+
+#### 🔄 RAG with Gemma 2B
+
+```bash
+python main.py --query "Climate change impact on economy" \
+               --rag_model gemma \
+               --personality "scientific"
+```
+
+This uses **Gemma 2B** to generate LLM-based summaries and the final report.
+
+---
+
+### 6. Troubleshooting
+
+- **Missing dependencies?** Rerun: `pip install -r requirements.txt`
+- **Ollama not found?** Ensure it’s installed (`ollama list` shows `gemma:2b`).
+- **Memory issues?** Use `--device cpu`.
+- **Too many subqueries?** Lower `--max_depth` to 1.
+
+---
+
+### 7. Next Steps
+
+- **Try different retrieval models** (`--retrieval_model all-minilm`).
+- **Tweak recursion** (`--max_depth`).
+- **Tune** `config.yaml` for web search limits, `min_relevance`, or Monte Carlo search.
+
+---
+
+## Detailed Design: NanoSage Architecture
+
+### 1. Core Input Parameters
+
+- **User Query**: E.g. `"Quantum computing in healthcare"`.
+- **CLI Flags** (in `main.py`):
+  ```
+  --corpus_dir
+  --device
+  --retrieval_model
+  --top_k
+  --web_search
+  --personality
+  --rag_model
+  --max_depth
+  ```
+- **YAML Config** (e.g. `config.yaml`):
+  - `"results_base_dir"`, `"max_query_length"`, `"web_search_limit"`, `"min_relevance"`, etc.
+
+### 2. Configuration & Session Setup
+
+1. **Configuration**:  
+   `load_config(config_path)` to read YAML settings.
+   - **`min_relevance`**: cutoff for subquery branching.
+
+2. **Session Initialization**:  
+   `SearchSession.__init__()` sets:
+   - A unique `query_id` & `base_result_dir`.
+   - Enhanced query via `chain_of_thought_query_enhancement()`.
+   - Retrieval model loaded with `load_retrieval_model()`.
+   - Query embedding for relevance checks (`embed_text()`).
+   - Local files (if any) loaded & added to `KnowledgeBase`.
+
+### 3. Recursive Web Search & TOC Tracking
+
+1. **Subquery Generation**:  
+   - The enhanced query is split with `split_query()`.
+2. **Relevance Filtering**:  
+   - For each subquery, compare embeddings with the main query (via `late_interaction_score()`).  
+   - If `< min_relevance`, skip to avoid rabbit holes.
+3. **TOCNode Creation**:  
+   - Each subquery → `TOCNode`, storing the text, summary, relevance, etc.
+4. **Web Data**:  
+   - If relevant:  
+     - `download_webpages_ddg()` to fetch results.  
+     - `parse_html_to_text()` and embed them.  
+     - Summarize snippets (`summarize_text()`).  
+   - If `current_depth < max_depth`, optionally **expand** new sub-subqueries (chain-of-thought on the current subquery).
+5. **Hierarchy**:  
+   - All subqueries & expansions form a tree of TOC nodes for the final report.
+
+### 4. Local Retrieval & Summaries
+
+1. **Local Documents** + **Downloaded Web Entries** → appended into `KnowledgeBase`.
+2. **KnowledgeBase.search(...)** for top-K relevant docs.
+3. Summaries:
+   - Summarize web results & local retrieval with `summarize_text()`.
+
+### 5. Final RAG Prompt & Report Generation
+
+1. **_build_final_answer(...)**:
+   - Constructs a large prompt including:
+     - The user query,
+     - Table of Contents (with node summaries),
+     - Summaries of web & local results,
+     - Reference URLs.
+   - Asks for a “multi-section advanced markdown report.”
+2. **rag_final_answer(...)**:
+   - Calls `call_gemma()` (or other LLM) to produce the final text.
+3. **aggregate_results(...)**:
+   - Saves the final answer plus search data into a `.md` file in `results/<query_id>/`.
+
+### 6. Balancing Exploration vs. Exploitation
+
+- Subqueries with **relevance_score < min_relevance** are skipped.
+- Depth-limited recursion ensures not to blow up on too many expansions.
+- **Monte Carlo** expansions (optional) can sample random subqueries to avoid missing unexpected gems.
+
+### 7. Final Output
+
+- **Markdown report** summarizing relevant subqueries, local docs, and a final advanced RAG-based discussion.
+
+---
 
 ## Summary Flow Diagram
 
-```
+```plaintext
 User Query
     │
     ▼
@@ -110,19 +227,19 @@ main.py:
               └── run_session():
                   └── perform_recursive_web_searches():
                       ├── For each subquery:
-                      │   ├─ Compute relevance_score = late_interaction_score()
+                      │   ├─ Compute relevance_score
                       │   ├─ if relevance_score < min_relevance: skip
                       │   ├─ else:
                       │   │   ├─ download_webpages_ddg()
                       │   │   ├─ parse_html_to_text(), embed
                       │   │   ├─ summarize_text() → store in TOCNode
-                      │   │   └─ if current_depth < max_depth:
-                      │   │       └─ recursively expand additional subqueries
-                      └── Aggregates web corpus and builds TOC
+                      │   │   └─ if depth < max_depth:
+                      │   │       └─ recursively expand
+                      └── Aggregates web corpus, builds TOC
               │
               ├── KnowledgeBase.search(enhanced_query, top_k)
               ├── Summarize results
-              ├── _build_final_answer() constructs prompt
+              ├── _build_final_answer() → prompt
               ├── rag_final_answer() → call_gemma()
               └── aggregate_results() → saves Markdown
 ```
