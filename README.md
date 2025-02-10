@@ -41,6 +41,14 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 
 ---
 
+4. Make sure to update pyOpenSSL and cryptography:
+
+```bash
+pip install --upgrade pyOpenSSL cryptography
+```
+*(Replace `cu118` with your CUDA version.)*
+
+
 ### 2. Set Up Ollama & Pull the Gemma Model
 
 1. **Install Ollama**:
