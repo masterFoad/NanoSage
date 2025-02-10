@@ -17,7 +17,7 @@ Where the table of content is basically its search graph. 🧙
 ## Example Report
 
 You can find an example report in the following link:  
-[example report outout for query: "Create a structure bouldering gym workout to push my climbing from v4 to v6"](https://github.com/masterFoad/NanoSage/blob/main/example_report.md)
+[example report output for query: "Create a structure bouldering gym workout to push my climbing from v4 to v6"](https://github.com/masterFoad/NanoSage/blob/main/example_report.md)
 
 ---
 
