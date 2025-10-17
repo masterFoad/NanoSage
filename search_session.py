@@ -7,9 +7,11 @@ import time
 import re
 import random
 import yaml
+import torch
 
 from knowledge_base import KnowledgeBase, late_interaction_score, load_corpus_from_dir, load_retrieval_model, embed_text
-from web_search import download_webpages_ddg, parse_html_to_text, group_web_results_by_domain, sanitize_filename
+from web_crawler import search_and_download, parse_any_to_text, sanitize_filename
+import json
 from aggregator import aggregate_results
 
 #############################################
@@ -175,14 +177,24 @@ class SearchSession:
             model_choice=self.retrieval_model,
             device=self.device
         )
+        
+        # For vision models, also load a fast text model for web content
+        self.text_model = None
+        if self.model_type in ["siglip", "clip"]:
+            from sentence_transformers import SentenceTransformer
+            self.text_model = SentenceTransformer("all-MiniLM-L6-v2", device=self.device)
 
         # Compute the overall enhanced query embedding once.
         print("[INFO] Computing embedding for enhanced query...")
-        self.enhanced_query_embedding = embed_text(self.enhanced_query, self.model, self.processor, self.model_type, self.device)
+        if self.model_type in ["siglip", "clip"] and self.text_model:
+            # Use text model for query embedding to match web content embeddings
+            self.enhanced_query_embedding = self.text_model.encode(self.enhanced_query, convert_to_tensor=True)
+        else:
+            self.enhanced_query_embedding = embed_text(self.enhanced_query, self.model, self.processor, self.model_type, self.device)
 
         # Create a knowledge base.
         print("[INFO] Creating KnowledgeBase...")
-        self.kb = KnowledgeBase(self.model, self.processor, model_type=self.model_type, device=self.device)
+        self.kb = KnowledgeBase(self.model, self.processor, model_type=self.model_type, device=self.device, text_model=self.text_model)
 
         # Load local corpus if available.
         self.corpus = []
@@ -250,7 +262,10 @@ class SearchSession:
             sq_clean = clean_search_query(sq)
             if not sq_clean:
                 continue
-            node_emb = embed_text(sq_clean, self.model, self.processor, self.model_type, self.device)
+            if self.model_type in ["siglip", "clip"] and self.text_model:
+                node_emb = self.text_model.encode(sq_clean, convert_to_tensor=True)
+            else:
+                node_emb = embed_text(sq_clean, self.model, self.processor, self.model_type, self.device)
             score = late_interaction_score(self.enhanced_query_embedding, node_emb)
             scored_subqs.append((sq_clean, score))
 
@@ -288,7 +303,10 @@ class SearchSession:
             # Create a TOC node
             toc_node = TOCNode(query_text=sq_clean, depth=current_depth)
             # Relevance
-            node_embedding = embed_text(sq_clean, self.model, self.processor, self.model_type, self.device)
+            if self.model_type in ["siglip", "clip"] and self.text_model:
+                node_embedding = self.text_model.encode(sq_clean, convert_to_tensor=True)
+            else:
+                node_embedding = embed_text(sq_clean, self.model, self.processor, self.model_type, self.device)
             relevance = late_interaction_score(self.enhanced_query_embedding, node_embedding)
             toc_node.relevance_score = relevance
 
@@ -302,7 +320,13 @@ class SearchSession:
             os.makedirs(subquery_dir, exist_ok=True)
             print(f"[DEBUG] Searching web for subquery '{sq_clean}' at depth={current_depth}...")
 
-            pages = await download_webpages_ddg(sq_clean, limit=self.config.get("web_search_limit", 5), output_dir=subquery_dir)
+            pages = await search_and_download(
+                keyword=sq_clean, 
+                out_dir=subquery_dir,
+                top_n=self.config.get("web_search_limit", 5),
+                concurrency=self.config.get("web_concurrency", 8),
+                include_wikipedia=self.config.get("include_wikipedia", False)
+            )
             branch_web_results = []
             branch_corpus_entries = []
             for page in pages:
@@ -310,31 +334,54 @@ class SearchSession:
                     continue
                 file_path = page.get("file_path")
                 url = page.get("url")
+                meta = page.get("meta", {})
                 if not file_path or not url:
                     continue
-                raw_text = parse_html_to_text(file_path)
+                
+                # Use the web crawler's robust parsing function
+                raw_text = parse_any_to_text(file_path)
                 if not raw_text.strip():
                     continue
-                snippet = raw_text[:100].replace('\n', ' ') + "..."
+                
+                # Use metadata from sidecar JSON if available, otherwise create snippet
+                snippet = meta.get("text_preview", raw_text[:100].replace('\n', ' ') + "...")
                 limited_text = raw_text[:2048]
+                
                 try:
-                    if self.model_type == "colpali":
+                    # For web content (HTML/text), always use fast text embeddings
+                    # SigLIP/CLIP are only for vision tasks (images, PDFs)
+                    if self.model_type in ["siglip", "clip"] and self.text_model:
+                        # Use pre-loaded fast text model for web content
+                        emb = self.text_model.encode(limited_text, convert_to_tensor=True)
+                    elif self.model_type == "colpali":
                         inputs = self.processor(text=[limited_text], truncation=True, max_length=512, return_tensors="pt").to(self.device)
                         outputs = self.model(**inputs)
                         emb = outputs.embeddings.mean(dim=1).squeeze(0)
                     else:
+                        # all-MiniLM or other text models
                         emb = self.model.encode(limited_text, convert_to_tensor=True)
+                    
                     entry = {
                         "embedding": emb,
                         "metadata": {
                             "file_path": file_path,
                             "type": "webhtml",
                             "snippet": snippet,
-                            "url": url
+                            "url": url,
+                            "source_engine": meta.get("source_engine", "unknown"),
+                            "content_type": meta.get("content_type", ""),
+                            "size": meta.get("size", 0),
+                            "published_hint": meta.get("published_hint"),
+                            "downloaded_at": meta.get("downloaded_at")
                         }
                     }
                     branch_corpus_entries.append(entry)
-                    branch_web_results.append({"url": url, "snippet": snippet})
+                    branch_web_results.append({
+                        "url": url, 
+                        "snippet": snippet,
+                        "title": meta.get("title", ""),
+                        "source_engine": meta.get("source_engine", "unknown")
+                    })
                 except Exception as e:
                     print(f"[WARN] Error embedding page '{url}': {e}")
 
@@ -361,10 +408,22 @@ class SearchSession:
             aggregated_corpus_entries.extend(branch_corpus_entries)
             toc_nodes.append(toc_node)
 
-        grouped = group_web_results_by_domain(
-            [{"url": r["url"], "file_path": e["metadata"]["file_path"], "content_type": e["metadata"].get("content_type", "")}
-             for r, e in zip(aggregated_web_results, aggregated_corpus_entries)]
-        )
+        # Group results by domain for reporting
+        grouped = {}
+        for r, e in zip(aggregated_web_results, aggregated_corpus_entries):
+            url = r.get("url", "")
+            if url:
+                from urllib.parse import urlparse
+                domain = urlparse(url).netloc
+                if domain not in grouped:
+                    grouped[domain] = []
+                grouped[domain].append({
+                    "url": url, 
+                    "file_path": e["metadata"]["file_path"], 
+                    "content_type": e["metadata"].get("content_type", ""),
+                    "title": r.get("title", ""),
+                    "source_engine": r.get("source_engine", "unknown")
+                })
         return aggregated_web_results, aggregated_corpus_entries, grouped, toc_nodes
 
     def _summarize_web_results(self, web_results):
@@ -373,7 +432,9 @@ class SearchSession:
         for w in web_results:
             url = w.get('url')
             snippet = w.get('snippet')
-            lines.append(f"URL: {url} - snippet: {snippet}")
+            title = w.get('title', '')
+            source_engine = w.get('source_engine', 'unknown')
+            lines.append(f"URL: {url} - Title: {title} - Source: {source_engine} - snippet: {snippet}")
             reference_urls.append(url)
         text = "\n".join(lines)
         # We'll store reference URLs in self._reference_links for final prompt

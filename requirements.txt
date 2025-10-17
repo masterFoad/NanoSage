@@ -7,11 +7,22 @@ pyyaml
 
 # Web and Parsing
 aiohttp
-duckduckgo_search
+duckduckgo-search
 beautifulsoup4
+trafilatura
+readability-lxml
+python-dateutil
 pymupdf  # PyMuPDF for PDF handling
 pytesseract
 Pillow   # for image handling
 
+# Optional speed-ups / OCR
+aiohttp-client-cache
+ocrmypdf
+
 # Optional LLM Integration
 ollama
+
+# Tavily Search API
+langchain-tavily
+python-dotenv
