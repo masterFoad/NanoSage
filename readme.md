@@ -4,6 +4,14 @@ A multi-modal, **relevance-aware**, recursive search session pipeline that enhan
 
 With Monte Carlo-based exploration, the system balances depth vs. breadth, ranking each branch's relevance to ensure precision and avoid unrelated tangents. The result? A detailed, well-organized report generated using retrieval-augmented generation (RAG), integrating the most valuable insights.
 
+## 📅 Latest Update - October 17, 2025
+
+> **Major System Enhancement**: Tavily Integration & Hybrid Embedding Architecture
+
+- **Tavily Search API Integration**: Replaced unreliable free search engines with Tavily's robust API, enabling access to high-quality academic sources including PubMed, research journals, and scholarly databases
+- **Hybrid Embedding System**: Implemented intelligent model selection where SigLIP/CLIP handle vision tasks (images, PDFs) while all-MiniLM processes text content, eliminating dimension mismatches and optimizing performance
+- **Enhanced Web Crawler**: Added comprehensive web content extraction with metadata generation, domain grouping, and fallback search engines for maximum reliability and coverage
+
 ## Quick Start
 
 ### 1. Setup Environment
