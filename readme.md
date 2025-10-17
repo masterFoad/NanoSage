@@ -1,95 +1,6 @@
-# 🧙‍♂️ NanoSage: Advanced Search Session and Report Generation Pipeline
+# Advanced Search Session and Report Generation Pipeline (With Relevance Filtering)
 
-A multi-modal, **relevance-aware**, recursive search session pipeline that enhances user queries, builds knowledge bases from local and web data, and generates comprehensive reports using retrieval-augmented generation (RAG).
-
-With Monte Carlo-based exploration, the system balances depth vs. breadth, ranking each branch's relevance to ensure precision and avoid unrelated tangents. The result? A detailed, well-organized report generated using retrieval-augmented generation (RAG), integrating the most valuable insights.
-
-## 📅 Latest Update - October 17, 2025
-
-> **Major System Enhancement**: Tavily Integration & Hybrid Embedding Architecture
-
-- **Tavily Search API Integration**: Replaced unreliable free search engines with Tavily's robust API, enabling access to high-quality academic sources including PubMed, research journals, and scholarly databases
-- **Hybrid Embedding System**: Implemented intelligent model selection where SigLIP/CLIP handle vision tasks (images, PDFs) while all-MiniLM processes text content, eliminating dimension mismatches and optimizing performance
-- **Enhanced Web Crawler**: Added comprehensive web content extraction with metadata generation, domain grouping, and fallback search engines for maximum reliability and coverage
-
-## Quick Start
-
-### 1. Setup Environment
-
-```bash
-# Clone the repository
-git clone https://github.com/masterFoad/NanoSage.git
-cd NanoSage
-
-# Create conda environment
-conda create -n nanosage python=3.9
-conda activate nanosage
-
-# Install dependencies
-pip install -r requirements.txt
-```
-
-### 2. Configure API Keys
-
-```bash
-# Copy the example environment file
-cp env.example .env
-
-# Edit .env and add your Tavily API key
-# Get your free API key at: https://tavily.com/
-TAVILY_API_KEY=your_tavily_api_key_here
-```
-
-### 3. Run Examples
-
-```bash
-# Basic web search with SigLIP (vision + text hybrid)
-python main.py --query "machine learning algorithms" --retrieval_model siglip --web_search
-
-# Web search with local documents
-python main.py --query "quantum computing" --corpus_dir ./my_documents --retrieval_model siglip --web_search
-
-# Fast text-only search
-python main.py --query "artificial intelligence" --retrieval_model all-minilm --web_search
-
-# Local documents only (no web search)
-python main.py --query "research papers" --corpus_dir ./my_documents --retrieval_model colpali
-```
-
-## Available Models
-
-- **`siglip`**: Vision + text hybrid (recommended for images/PDFs + web content)
-- **`clip`**: Vision + text hybrid (alternative to SigLIP)
-- **`colpali`**: Advanced text model (good for documents)
-- **`all-minilm`**: Fast text model (good for speed)
-
-## Supported File Types
-
-- **Text**: `.txt`, `.md`, `.py`, `.json`, `.yaml`, `.csv`
-- **PDFs**: Converted to images for vision models, OCR for text models
-- **Images**: `.png`, `.jpg`, `.jpeg` (vision models or OCR fallback)
-
-## Hybrid Embedding System
-
-NanoSage uses a **hybrid embedding approach** for optimal performance:
-
-- **Vision Models (SigLIP/CLIP)**: 
-  - Use **SigLIP/CLIP** for images and PDFs → images
-  - Use **all-MiniLM** for text content (web pages, documents)
-  - Ensures consistent 384D embeddings for text content
-
-- **Text Models (ColPali/all-MiniLM)**:
-  - Use the same model for all content types
-  - Consistent embedding dimensions
-
-This approach eliminates dimension mismatches and uses the right tool for each content type.
-
-## Web Search Integration
-
-- **Primary**: Tavily Search API (reliable, academic sources)
-- **Fallback**: DuckDuckGo, SearxNG, Wikipedia
-- **Sources**: PubMed, academic journals, research databases
-- **Features**: Real-time search, content extraction, metadata generation
+This document describes the algorithm for our multi-modal, **relevance-aware**, recursive search session pipeline. The system enhances a user query, builds a knowledge base from local and web data, recursively explores subqueries (tracking the search hierarchy via a Table of Contents, TOC), **ranks each branch’s relevance** to avoid diving into unrelated topics, and finally generates a detailed report using retrieval-augmented generation (RAG).
 
 ## 1. Initialization and Setup
 
@@ -129,13 +40,7 @@ This approach eliminates dimension mismatches and uses the right tool for each c
 
    - The **enhanced query** is cleaned with `clean_search_query(query)` and split into smaller subqueries using `split_query(query, max_len)`.
 
-2. **Monte Carlo Subquery Sampling (Optional):**
-   
-   - The system can use a **Monte Carlo approach** to intelligently sample the most relevant subqueries, balancing exploration depth with computational efficiency.
-   - Each subquery is scored for relevance against the main query using embedding similarity.
-   - Only the most promising subqueries are selected for further exploration.
-
-3. **Recursive Web Search with TOC Tracking & Relevance Scoring:**
+2. **Recursive Web Search with TOC Tracking & Relevance Scoring:**
    - If `web_search_enabled` is true, `SearchSession.run_session()` calls `perform_recursive_web_searches(subqueries, current_depth=1)`.
    - **For each subquery**:
      - A **`TOCNode`** is created to represent this branch, storing:
@@ -145,7 +50,7 @@ This approach eliminates dimension mismatches and uses the right tool for each c
          - If `relevance_score < min_relevance`, the branch is skipped (no web search or deeper subqueries).
        - If above the relevance threshold:
          - A sanitized directory is created (e.g. `web_<subquery>`) via `sanitize_filename()`.
-         - **Web results** are downloaded via Tavily API (`search_and_download()`), parsed (`parse_any_to_text()`), and embedded.
+         - **Web results** are downloaded (`download_webpages_ddg()`), parsed (`parse_html_to_text()`), and embedded.
          - **Branch Summaries** are generated with `summarize_text()`.
          - If `current_depth < max_depth`, the system can generate **additional subqueries** (via `chain_of_thought_query_enhancement()`) and recurse further.
    - This process produces a hierarchical **TOC** structure of relevant branches and their summaries.
@@ -186,7 +91,7 @@ By **comparing each subquery’s embedding** to the main query embedding, we:
 
 ## 6. Final Output
 
-Markdown report summarizing relevant subqueries, local docs, and a final advanced RAG-based discussion. The pipeline outputs a **Markdown report** summarizing the relevant subqueries, local documents, and a thoroughly generated final text via RAG. The path to this report is printed by `main.py`.
+- The pipeline outputs a **Markdown report** summarizing the relevant subqueries, local documents, and a thoroughly generated final text via RAG. The path to this report is printed by `main.py`.
 
 ## Summary Flow Diagram
 
@@ -208,8 +113,8 @@ main.py:
                       │   ├─ Compute relevance_score = late_interaction_score()
                       │   ├─ if relevance_score < min_relevance: skip
                       │   ├─ else:
-                      │   │   ├─ search_and_download() (Tavily API)
-                      │   │   ├─ parse_any_to_text(), embed
+                      │   │   ├─ download_webpages_ddg()
+                      │   │   ├─ parse_html_to_text(), embed
                       │   │   ├─ summarize_text() → store in TOCNode
                       │   │   └─ if current_depth < max_depth:
                       │   │       └─ recursively expand additional subqueries
