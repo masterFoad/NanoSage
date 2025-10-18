@@ -326,7 +326,14 @@ class SearchSession:
         self.corpus = []
         if self.corpus_dir:
             print(f"[INFO] Loading local documents from {self.corpus_dir}")
-            local_docs = load_corpus_from_dir(self.corpus_dir, self.model, self.processor, self.device, self.model_type)
+            local_docs = load_corpus_from_dir(
+                self.corpus_dir,
+                self.model,
+                self.processor,
+                self.device,
+                self.model_type,
+                text_model=self.text_model  # Pass text_model for dimension consistency
+            )
             self.corpus.extend(local_docs)
         self.kb.add_documents(self.corpus)
 

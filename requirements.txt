@@ -1,13 +1,16 @@
 # Core Dependencies
 torch
+torchvision
 transformers
 sentence-transformers
+sentencepiece
+protobuf>=3.20
 numpy
 pyyaml
 
 # Web and Parsing
 aiohttp
-duckduckgo-search
+ddgs
 beautifulsoup4
 trafilatura
 readability-lxml
@@ -19,6 +22,7 @@ Pillow   # for image handling
 # Optional speed-ups / OCR
 aiohttp-client-cache
 ocrmypdf
+huggingface_hub[hf_xet]
 
 # LLM Integration
 ollama
@@ -30,3 +34,13 @@ ollama
 # Tavily Search API
 langchain-tavily
 python-dotenv
+
+# Web API Backend
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.0.0
+websockets>=12.0
+python-multipart>=0.0.6
+
+# Export functionality
+reportlab>=4.0.0

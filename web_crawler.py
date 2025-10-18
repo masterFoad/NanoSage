@@ -12,9 +12,9 @@ A plug-and-play upgrade to your original script that:
 - Includes a tiny CLI: see bottom (`python metasearch_crawler.py --help`).
 
 Dependencies (all free):
-  pip install duckduckgo-search aiohttp bs4 trafilatura readability-lxml python-dateutil pymupdf
+  pip install ddgs aiohttp bs4 trafilatura readability-lxml python-dateutil pymupdf
 Optional:
-  pip install aiohttp-client-cache pytesseract ocrmypdf
+  pip install aiohttp-client-cache pytesseract ocrmypdf huggingface_hub[hf_xet]
 
 Notes / Ethics:
 - Be polite: robots.txt, modest concurrency, and do not hammer public SearxNG instances.
@@ -42,7 +42,7 @@ from datetime import datetime
 
 # --- Third-party imports (soft-fail where possible) ---
 try:
-    from duckduckgo_search import DDGS  # free text/news/images search
+    from ddgs import DDGS  # free text/news/images search
 except Exception:  # pragma: no cover
     DDGS = None
 
@@ -612,7 +612,9 @@ def extract_html_text(html_bytes: bytes) -> str:
     # 2) readability-lxml
     if Document is not None:
         try:
-            doc = Document(html_bytes)
+            # Decode bytes to string for readability-lxml
+            html_str = html_bytes.decode('utf-8', errors='ignore') if isinstance(html_bytes, bytes) else html_bytes
+            doc = Document(html_str)
             html = doc.summary()
             soup = BeautifulSoup(html, "html.parser")
             for t in soup(["script", "style", "noscript"]):

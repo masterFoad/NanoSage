@@ -33,23 +33,23 @@ def load_retrieval_model(model_choice="colpali", device="cpu"):
     if model_choice == "siglip":
         from transformers import SiglipModel, SiglipProcessor
         name = "google/siglip-base-patch16-224"
-        model = SiglipModel.from_pretrained(name, torch_dtype=dtype).to(device).eval()
-        processor = SiglipProcessor.from_pretrained(name)
+        model = SiglipModel.from_pretrained(name, dtype=dtype).to(device).eval()
+        processor = SiglipProcessor.from_pretrained(name, use_fast=True)
         model_type = "siglip"
 
     elif model_choice == "clip":
         from transformers import CLIPModel, CLIPProcessor
         name = "openai/clip-vit-base-patch32"
-        model = CLIPModel.from_pretrained(name, torch_dtype=dtype).to(device).eval()
-        processor = CLIPProcessor.from_pretrained(name)
+        model = CLIPModel.from_pretrained(name, dtype=dtype).to(device).eval()
+        processor = CLIPProcessor.from_pretrained(name, use_fast=True)
         model_type = "clip"
 
     elif model_choice == "colpali":
         from transformers import ColPaliForRetrieval, ColPaliProcessor
         name = "vidore/colpali-v1.2-hf"
         # keep your semantics, just ensure dtype/device
-        model = ColPaliForRetrieval.from_pretrained(name, torch_dtype=torch.bfloat16).to(device).eval()
-        processor = ColPaliProcessor.from_pretrained(name)
+        model = ColPaliForRetrieval.from_pretrained(name, dtype=torch.bfloat16).to(device).eval()
+        processor = ColPaliProcessor.from_pretrained(name, use_fast=True)
         model_type = "colpali"
 
     elif model_choice == "all-minilm":
@@ -208,13 +208,17 @@ def _pdf_pages_to_images(pdf_path: str, max_pages: int = 4, dpi: int = 144):
         return []
 
 
-def load_corpus_from_dir(corpus_dir, model, processor, device="cpu", model_type="colpali"):
+def load_corpus_from_dir(corpus_dir, model, processor, device="cpu", model_type="colpali", text_model=None):
     """
     Scan 'corpus_dir' for txt, pdf, and image files, embed their content,
     and return a list of { 'embedding': torch.Tensor(cpu), 'metadata':... }.
     - For VLMs (siglip/clip): images & PDF pages are embedded directly (no OCR needed).
     - For text-only models: text is extracted (OCR for images as fallback) and embedded.
     - PDFs: combine (mean-pool) text chunks + first few rendered pages (VLMs) for robustness.
+
+    Args:
+        text_model: Optional separate text model (e.g., all-MiniLM) for embedding text content
+                    when using vision models (siglip/clip). This ensures dimension consistency.
     """
     corpus = []
     if not corpus_dir or not os.path.isdir(corpus_dir):
@@ -291,17 +295,52 @@ def load_corpus_from_dir(corpus_dir, model, processor, device="cpu", model_type=
         # Build final embedding
         try:
             embs = []
+
+            # For text content, use text_model if available (for vision models)
+            # This ensures dimension consistency across all embeddings
             if text.strip():
-                text_emb = _embed_long_text(text, model, processor, model_type, device)
-                if text_emb is not None:
+                if model_type in ("siglip", "clip") and text_model:
+                    # Use text_model for text content to maintain consistent dimensions
+                    text_emb = text_model.encode(text[:1000], convert_to_tensor=True, device=device)
+                    text_emb = _l2norm(text_emb).cpu()
                     embs.append(text_emb)
-            embs.extend(img_embs)
+                else:
+                    # Use the main model for text embedding
+                    text_emb = _embed_long_text(text, model, processor, model_type, device)
+                    if text_emb is not None:
+                        embs.append(text_emb)
+
+            # For vision models, only add image embeddings if there's no text
+            # This prevents dimension mismatch when pooling
+            if model_type in ("siglip", "clip"):
+                if not text.strip() and img_embs:
+                    # Only images, no text - need to convert to text_model dimensions
+                    if text_model:
+                        # Can't mix image and text embeddings with different dimensions
+                        # Skip image-only files or use OCR
+                        if ext.endswith((".png", ".jpg", ".jpeg")):
+                            # For pure images, try OCR to get text representation
+                            try:
+                                import pytesseract
+                                img = Image.open(file_path)
+                                ocr_text = pytesseract.image_to_string(img)
+                                if ocr_text.strip():
+                                    text_emb = text_model.encode(ocr_text[:1000], convert_to_tensor=True, device=device)
+                                    embs.append(_l2norm(text_emb).cpu())
+                            except Exception:
+                                # Skip if OCR fails
+                                continue
+                    else:
+                        embs.extend(img_embs)
+            else:
+                # For non-vision models, add image embeddings normally
+                embs.extend(img_embs)
 
             if not embs:
                 # Nothing usable
                 continue
 
-            final_emb = _pool_mean(embs)
+            final_emb = _pool_mean(embs) if len(embs) > 1 else embs[0]
             snippet = (text[:100].replace('\n', ' ') + "...") if text else ""
 
             corpus.append({

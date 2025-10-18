@@ -93,3 +93,18 @@ htmlcov/
 .env.production
 secrets.yaml
 config.local.yaml
+
+# Web UI - Backend
+exports/
+backend/__pycache__/
+backend/**/__pycache__/
+*.pyc
+
+# Web UI - Frontend
+frontend/node_modules/
+frontend/build/
+frontend/.env.local
+frontend/.env.production
+frontend/package-lock.json
+frontend/yarn.lock
+frontend/.eslintcache

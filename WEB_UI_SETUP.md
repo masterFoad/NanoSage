@@ -1,0 +1,434 @@
+# NanoSage Web UI Setup Guide
+
+This guide will help you set up and run the NanoSage web interface, which provides a user-friendly way to interact with NanoSage's advanced recursive search capabilities.
+
+## Architecture Overview
+
+The web interface consists of two main components:
+
+1. **Backend (FastAPI)**: REST API with WebSocket support for real-time updates
+2. **Frontend (React + TypeScript)**: Modern, responsive web interface
+
+```
+NanoSage/
+├── backend/                    # FastAPI backend
+│   ├── api/
+│   │   ├── main.py            # FastAPI application
+│   │   ├── models.py          # Pydantic data models
+│   │   ├── websocket.py       # WebSocket manager
+│   │   └── routes.py          # API routes (future)
+│   ├── services/
+│   │   ├── query_service.py   # Query execution logic
+│   │   └── export_service.py  # Export functionality
+│   └── utils/
+│       └── validators.py      # Input validation
+├── frontend/                   # React frontend
+│   ├── src/
+│   │   ├── components/        # React components
+│   │   ├── services/          # API client
+│   │   ├── types/             # TypeScript types
+│   │   ├── App.tsx            # Main app component
+│   │   └── index.tsx          # Entry point
+│   ├── public/
+│   ├── package.json
+│   └── tsconfig.json
+└── (existing Python modules)
+```
+
+---
+
+## Prerequisites
+
+### Backend Requirements
+- Python 3.8 or higher
+- All existing NanoSage dependencies (see main README.md)
+- Additional packages (will be installed via requirements.txt):
+  - FastAPI
+  - Uvicorn
+  - WebSockets
+  - Pydantic v2
+  - ReportLab (for PDF export)
+
+### Frontend Requirements
+- Node.js 16 or higher
+- npm or yarn package manager
+
+---
+
+## Installation
+
+### 1. Install Backend Dependencies
+
+```bash
+# From the NanoSage root directory
+pip install -r requirements.txt
+```
+
+This will install all existing dependencies plus the new web API requirements:
+- `fastapi>=0.104.0`
+- `uvicorn[standard]>=0.24.0`
+- `pydantic>=2.0.0`
+- `websockets>=12.0`
+- `python-multipart>=0.0.6`
+- `reportlab>=4.0.0`
+
+### 2. Install Frontend Dependencies
+
+```bash
+# Navigate to frontend directory
+cd frontend
+
+# Install dependencies
+npm install
+
+# Or with yarn
+yarn install
+```
+
+---
+
+## Configuration
+
+### Backend Configuration
+
+The backend uses the existing `config.yaml` file for NanoSage configuration. No additional configuration is required for the API.
+
+**Optional**: Create a `.env` file in the root directory if you haven't already:
+
+```bash
+# Copy the example environment file
+cp env.example .env
+
+# Edit .env and add your Tavily API key
+TAVILY_API_KEY=your_tavily_api_key_here
+```
+
+### Frontend Configuration
+
+Create a `.env` file in the `frontend/` directory:
+
+```bash
+# frontend/.env
+REACT_APP_API_URL=http://localhost:8000
+REACT_APP_WS_URL=ws://localhost:8000
+```
+
+For production, update these URLs to your deployed backend URL.
+
+---
+
+## Running the Application
+
+### Development Mode
+
+You'll need to run both the backend and frontend servers:
+
+#### Terminal 1: Start the Backend
+
+```bash
+# From the NanoSage root directory
+python -m backend.api.main
+
+# Or with uvicorn directly
+uvicorn backend.api.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+The backend API will be available at:
+- API: http://localhost:8000
+- API Documentation: http://localhost:8000/docs
+- Health Check: http://localhost:8000/health
+
+#### Terminal 2: Start the Frontend
+
+```bash
+# From the frontend directory
+cd frontend
+npm start
+
+# Or with yarn
+yarn start
+```
+
+The frontend will be available at: http://localhost:3000
+
+### Production Build
+
+#### Backend
+
+```bash
+# Run with production settings
+uvicorn backend.api.main:app --host 0.0.0.0 --port 8000 --workers 4
+```
+
+#### Frontend
+
+```bash
+# Build the frontend
+cd frontend
+npm run build
+
+# The build output will be in frontend/build/
+# Serve it with any static file server or configure your web server
+```
+
+---
+
+## Using the Web Interface
+
+### 1. Submit a Query
+
+1. **Navigate to http://localhost:3000**
+2. **Enter your query** in the text area
+3. **Configure parameters**:
+   - **Web Search**: Enable/disable web search
+   - **Number of Documents**: How many documents to retrieve (1-20)
+   - **Search Depth**: Recursion depth for subqueries (1-3)
+4. **Advanced Parameters** (optional):
+   - Retrieval Model (SigLIP, CLIP, ColPali, all-MiniLM)
+   - LLM Provider (Ollama, OpenAI, Anthropic)
+   - RAG Model
+   - Personality
+   - Local Corpus Directory
+   - Web Concurrency
+   - Include Wikipedia
+5. **Click "Submit Query"**
+
+### 2. Monitor Progress
+
+Once submitted, you'll see:
+- **Real-time progress updates** via WebSocket
+- **Progress bar** showing completion percentage
+- **Activity log** with timestamped updates
+- **Current status** and messages
+
+### 3. View Results
+
+When the query completes, you'll see three tabs:
+
+#### Final Answer Tab
+- The aggregated result generated by NanoSage
+- Copy button to copy the text
+- Export panel to download results
+
+#### Sources Tab
+- **Web Sources**: Links and snippets from web search
+- **Local Sources**: Relevant local documents
+- Relevance scores for each source
+
+#### Search Tree Tab
+- Visual representation of the search exploration
+- Expandable/collapsible nodes
+- Relevance scores for each branch
+- Metrics for each node (web results, docs, processing time)
+
+### 4. Export Results
+
+From the Final Answer tab:
+1. Select export format:
+   - **Markdown**: Full formatting with links
+   - **Plain Text**: Clean text without formatting
+   - **PDF**: Professional document (requires reportlab)
+2. Click "Export"
+3. The file will download automatically
+
+---
+
+## API Endpoints
+
+The backend provides the following REST API endpoints:
+
+### Query Management
+
+- **POST /api/query/submit**: Submit a new query
+  ```json
+  {
+    "parameters": {
+      "query": "your question here",
+      "web_search": true,
+      "retrieval_model": "siglip",
+      "top_k": 5,
+      "max_depth": 1
+    }
+  }
+  ```
+
+- **GET /api/query/{query_id}**: Get query status and results
+
+- **GET /api/queries?limit=50**: List all queries
+
+### Export
+
+- **POST /api/query/export**: Export query results
+  ```json
+  {
+    "query_id": "uuid-here",
+    "format": "markdown"
+  }
+  ```
+
+### WebSocket
+
+- **WS /ws/{query_id}**: Connect to real-time progress updates
+
+### System
+
+- **GET /health**: Health check endpoint
+- **GET /**: API information
+
+Full API documentation is available at: http://localhost:8000/docs
+
+---
+
+## Troubleshooting
+
+### Backend Issues
+
+**Port already in use**
+```bash
+# Find process using port 8000
+netstat -ano | findstr :8000  # Windows
+lsof -i :8000                 # Linux/Mac
+
+# Kill the process or use a different port
+uvicorn backend.api.main:app --port 8001
+```
+
+**Import errors**
+```bash
+# Ensure you're running from the NanoSage root directory
+cd /path/to/NanoSage
+python -m backend.api.main
+```
+
+**Missing dependencies**
+```bash
+pip install -r requirements.txt --upgrade
+```
+
+### Frontend Issues
+
+**Dependencies not installing**
+```bash
+# Clear cache and reinstall
+cd frontend
+rm -rf node_modules package-lock.json
+npm install
+```
+
+**Build errors**
+```bash
+# Check Node.js version
+node --version  # Should be 16+
+
+# Update npm
+npm install -g npm@latest
+```
+
+**Can't connect to backend**
+- Ensure backend is running on port 8000
+- Check `.env` file has correct API URLs
+- Verify CORS settings in `backend/api/main.py`
+
+### Export Issues
+
+**PDF export fails**
+```bash
+# Install reportlab
+pip install reportlab
+
+# If still failing, PDF will fallback to text export
+# Check error message in the UI
+```
+
+---
+
+## Performance Optimization
+
+### Backend
+
+1. **Use multiple workers** in production:
+   ```bash
+   uvicorn backend.api.main:app --workers 4
+   ```
+
+2. **Configure concurrency** in query parameters:
+   - Reduce `web_concurrency` if memory is limited
+   - Lower `max_depth` for faster results
+
+3. **Use GPU** if available:
+   - Modify `query_service.py` to use `device="cuda"`
+
+### Frontend
+
+1. **Production build** is optimized:
+   ```bash
+   npm run build
+   ```
+
+2. **Use a CDN** for static assets
+
+3. **Enable gzip** compression on your web server
+
+---
+
+## Security Considerations
+
+### For Production Deployment
+
+1. **CORS Configuration**: Update `allow_origins` in `backend/api/main.py`:
+   ```python
+   allow_origins=["https://yourdomain.com"]
+   ```
+
+2. **HTTPS**: Use SSL/TLS for production
+   ```bash
+   uvicorn backend.api.main:app --ssl-keyfile key.pem --ssl-certfile cert.pem
+   ```
+
+3. **Rate Limiting**: Implement rate limiting for API endpoints
+
+4. **Authentication**: Add user authentication if needed
+
+5. **Input Validation**: Already implemented in `validators.py`
+
+6. **Environment Variables**: Never commit `.env` files
+
+---
+
+## Development Tips
+
+### Backend Development
+
+- **Auto-reload**: Use `--reload` flag during development
+- **API Docs**: Visit `/docs` for interactive API documentation
+- **Logging**: Check console for debug information
+- **Testing**: Use tools like Postman or curl to test endpoints
+
+### Frontend Development
+
+- **Hot Reload**: Changes automatically refresh the browser
+- **React DevTools**: Install browser extension for debugging
+- **Console Logging**: Check browser console for errors
+- **Network Tab**: Monitor API calls and WebSocket connections
+
+---
+
+## Next Steps
+
+- **Customize UI**: Modify components in `frontend/src/components/`
+- **Add Features**: Extend API endpoints in `backend/api/main.py`
+- **Styling**: Update CSS in `frontend/src/App.css`
+- **Deploy**: Consider platforms like Heroku, Vercel, or AWS
+
+---
+
+## Support
+
+For issues and questions:
+- Check existing issues: https://github.com/masterFoad/NanoSage/issues
+- Read the main README: [README.md](README.md)
+- Review API docs: http://localhost:8000/docs (when running)
+
+---
+
+**Generated with NanoSage Web UI Setup**
