@@ -20,8 +20,12 @@ Pillow   # for image handling
 aiohttp-client-cache
 ocrmypdf
 
-# Optional LLM Integration
+# LLM Integration
 ollama
+
+# Optional LLM Providers (install as needed)
+# openai          # For OpenAI API integration
+# anthropic       # For Anthropic Claude integration
 
 # Tavily Search API
 langchain-tavily
