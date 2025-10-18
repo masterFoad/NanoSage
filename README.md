@@ -1,4 +1,4 @@
-# NanoSage 🧙: Advanced Recursive Search & Report Generation  
+# 🧙‍♂️ NanoSage: Advanced Recursive Search & Report Generation  
 
 Deep Research assistant that runs on your laptop, using tiny models. - all open source!
 
@@ -6,11 +6,21 @@ Deep Research assistant that runs on your laptop, using tiny models. - all open 
 
 It offers a structured breakdown of a multi-source, relevance-driven, recursive search pipeline. It walks through how the system refines a user query, builds a knowledge base from local and web data, and dynamically explores subqueries—tracking progress through a Table of Contents (TOC).
 
-With Monte Carlo-based exploration, the system balances depth vs. breadth, ranking each branch’s relevance to ensure precision and avoid unrelated tangents. The result? A detailed, well-organized report generated using retrieval-augmented generation (RAG), integrating the most valuable insights.
+With Monte Carlo-based exploration, the system balances depth vs. breadth, ranking each branch's relevance to ensure precision and avoid unrelated tangents. The result? A detailed, well-organized report generated using retrieval-augmented generation (RAG), integrating the most valuable insights.
 
 I wanted to experiment with new research methods, so I thought, basically, when we research a topic, we randomly explore new ideas as we search, and NanoSage basically does that!
 It explores and records its journey, where each (relevant) step is a node... and then sums it up to you in a neat report!
 Where the table of content is basically its search graph. 🧙
+
+---
+
+## 📅 Latest Update - October 17, 2025
+
+> **Major System Enhancement**: Tavily Integration & Hybrid Embedding Architecture
+
+- **Tavily Search API Integration**: Replaced unreliable free search engines with Tavily's robust API, enabling access to high-quality academic sources including PubMed, research journals, and scholarly databases
+- **Hybrid Embedding System**: Implemented intelligent model selection where SigLIP/CLIP handle vision tasks (images, PDFs) while all-MiniLM processes text content, eliminating dimension mismatches and optimizing performance
+- **Enhanced Web Crawler**: Added comprehensive web content extraction with metadata generation, domain grouping, and fallback search engines for maximum reliability and coverage
 
 ---
 
@@ -39,7 +49,6 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 ```
 *(Replace `cu118` with your CUDA version.)*
 
-
 4. Make sure to update pyOpenSSL and cryptography:
 
 ```bash
@@ -47,7 +56,6 @@ pip install --upgrade pyOpenSSL cryptography
 ```
 
 ---
-
 
 ### 2. Set Up Ollama & Pull the Gemma Model
 
@@ -67,29 +75,62 @@ ollama pull gemma2:2b
 
 ---
 
-### 3. Run a Simple Search Query
-
-A sample command to run your **search session**:
+### 3. Configure API Keys
 
 ```bash
-python main.py --query "Create a structure bouldering gym workout to push my climbing from v4 to v6"  \
-               --web_search \
-               --max_depth 2 \
-               --device cpu \
-               --top_k 10 \
-               --retrieval_model colpali
+# Copy the example environment file
+cp env.example .env
+
+# Edit .env and add your Tavily API key
+# Get your free API key at: https://tavily.com/
+TAVILY_API_KEY=your_tavily_api_key_here
+```
+
+---
+
+### 4. Run Examples
+
+```bash
+# Basic web search with SigLIP (vision + text hybrid) - RECOMMENDED
+python main.py --query "machine learning algorithms" --retrieval_model siglip --web_search
+
+# Web search with local documents
+python main.py --query "quantum computing" --corpus_dir ./my_documents --retrieval_model siglip --web_search
+
+# Fast text-only search
+python main.py --query "artificial intelligence" --retrieval_model all-minilm --web_search
+
+# Local documents only (no web search)
+python main.py --query "research papers" --corpus_dir ./my_documents --retrieval_model colpali
 ```
 
 **Parameters**:
 - `--query`: Main search query (natural language).
-- `--web_search`: Enables web-based retrieval.
-- `--max_depth`: Recursion depth for subqueries (2 levels).
+- `--web_search`: Enables web-based retrieval via Tavily API.
+- `--retrieval_model`: Choose from `siglip` (recommended), `clip`, `colpali`, or `all-minilm`.
 - `--device cpu`: Uses CPU (swap with `cuda` for GPU).
-- `--retrieval_model colpali`: Uses **ColPali** for retrieval (try `all-minilm` for lighter model).
+- `--max_depth`: Recursion depth for subqueries (default: 1).
 
 ---
 
-### 4. Check Results & Report
+### 5. Available Models
+
+- **`siglip`**: Vision + text hybrid (recommended for images/PDFs + web content)
+- **`clip`**: Vision + text hybrid (alternative to SigLIP)
+- **`colpali`**: Advanced text model (good for documents)
+- **`all-minilm`**: Fast text model (good for speed)
+
+---
+
+### 6. Supported File Types
+
+- **Text**: `.txt`, `.md`, `.py`, `.json`, `.yaml`, `.csv`
+- **PDFs**: Converted to images for vision models, OCR for text models
+- **Images**: `.png`, `.jpg`, `.jpeg` (vision models or OCR fallback)
+
+---
+
+### 7. Check Results & Report
 
 A **detailed Markdown report** will appear in `results/<query_id>/`.
 
@@ -107,7 +148,7 @@ Open the `*_output.md` file (e.g., `Quantum_computing_in_healthcare_output.md`) 
 
 ---
 
-### 5. Advanced Options
+### 8. Advanced Options
 
 #### ✅ Using Local Files
 
@@ -134,20 +175,45 @@ This uses **Gemma 2B** to generate LLM-based summaries and the final report.
 
 ---
 
-### 6. Troubleshooting
+### 9. Troubleshooting
 
 - **Missing dependencies?** Rerun: `pip install -r requirements.txt`
-- **Ollama not found?** Ensure it’s installed (`ollama list` shows `gemma:2b`).
+- **Ollama not found?** Ensure it's installed (`ollama list` shows `gemma:2b`).
 - **Memory issues?** Use `--device cpu`.
 - **Too many subqueries?** Lower `--max_depth` to 1.
+- **Web search not working?** Check your `TAVILY_API_KEY` in `.env` file.
 
 ---
 
-### 7. Next Steps
+### 10. Next Steps
 
-- **Try different retrieval models** (`--retrieval_model all-minilm`).
+- **Try different retrieval models** (`--retrieval_model siglip` for best results).
 - **Tweak recursion** (`--max_depth`).
 - **Tune** `config.yaml` for web search limits, `min_relevance`, or Monte Carlo search.
+
+---
+
+## Hybrid Embedding System
+
+NanoSage uses a **hybrid embedding approach** for optimal performance:
+
+- **Vision Models (SigLIP/CLIP)**: 
+  - Use **SigLIP/CLIP** for images and PDFs → images
+  - Use **all-MiniLM** for text content (web pages, documents)
+  - Ensures consistent 384D embeddings for text content
+
+- **Text Models (ColPali/all-MiniLM)**:
+  - Use the same model for all content types
+  - Consistent embedding dimensions
+
+This approach eliminates dimension mismatches and uses the right tool for each content type.
+
+## Web Search Integration
+
+- **Primary**: Tavily Search API (reliable, academic sources)
+- **Fallback**: DuckDuckGo, SearxNG, Wikipedia
+- **Sources**: PubMed, academic journals, research databases
+- **Features**: Real-time search, content extraction, metadata generation
 
 ---
 
@@ -188,18 +254,27 @@ This uses **Gemma 2B** to generate LLM-based summaries and the final report.
 
 1. **Subquery Generation**:  
    - The enhanced query is split with `split_query()`.
-2. **Relevance Filtering**:  
+
+2. **Monte Carlo Subquery Sampling (Optional)**:  
+   - The system can use a **Monte Carlo approach** to intelligently sample the most relevant subqueries, balancing exploration depth with computational efficiency.
+   - Each subquery is scored for relevance against the main query using embedding similarity.
+   - Only the most promising subqueries are selected for further exploration.
+
+3. **Relevance Filtering**:  
    - For each subquery, compare embeddings with the main query (via `late_interaction_score()`).  
    - If `< min_relevance`, skip to avoid rabbit holes.
-3. **TOCNode Creation**:  
+
+4. **TOCNode Creation**:  
    - Each subquery → `TOCNode`, storing the text, summary, relevance, etc.
-4. **Web Data**:  
+
+5. **Web Data**:  
    - If relevant:  
-     - `download_webpages_ddg()` to fetch results.  
-     - `parse_html_to_text()` and embed them.  
+     - `search_and_download()` via Tavily API to fetch results.  
+     - `parse_any_to_text()` and embed them.  
      - Summarize snippets (`summarize_text()`).  
    - If `current_depth < max_depth`, optionally **expand** new sub-subqueries (chain-of-thought on the current subquery).
-5. **Hierarchy**:  
+
+6. **Hierarchy**:  
    - All subqueries & expansions form a tree of TOC nodes for the final report.
 
 ### 4. Local Retrieval & Summaries
@@ -217,9 +292,11 @@ This uses **Gemma 2B** to generate LLM-based summaries and the final report.
      - Table of Contents (with node summaries),
      - Summaries of web & local results,
      - Reference URLs.
-   - Asks for a “multi-section advanced markdown report.”
+   - Asks for a "multi-section advanced markdown report."
+
 2. **rag_final_answer(...)**:
    - Calls `call_gemma()` (or other LLM) to produce the final text.
+
 3. **aggregate_results(...)**:
    - Saves the final answer plus search data into a `.md` file in `results/<query_id>/`.
 
@@ -255,8 +332,8 @@ main.py:
                       │   ├─ Compute relevance_score
                       │   ├─ if relevance_score < min_relevance: skip
                       │   ├─ else:
-                      │   │   ├─ download_webpages_ddg()
-                      │   │   ├─ parse_html_to_text(), embed
+                      │   │   ├─ search_and_download() (Tavily API)
+                      │   │   ├─ parse_any_to_text(), embed
                       │   │   ├─ summarize_text() → store in TOCNode
                       │   │   └─ if depth < max_depth:
                       │   │       └─ recursively expand
@@ -269,6 +346,7 @@ main.py:
               └── aggregate_results() → saves Markdown
 ```
 
+---
 
 If you found **NanoSage** useful for your research or project - or saved you 1 minute of googling, please consider citing it:  
 
@@ -284,4 +362,4 @@ If you found **NanoSage** useful for your research or project - or saved you 1 m
 ```
 
 **APA Citation:**  
-Foad, Abo Dahood. (2025). *NanoSage: A Recursive, Relevance-Driven Search and RAG Pipeline*. Retrieved from [https://github.com/masterFoad/NanoSage](https://github.com/masterFoad/NanoSage) 
+Foad, Abo Dahood. (2025). *NanoSage: A Recursive, Relevance-Driven Search and RAG Pipeline*. Retrieved from [https://github.com/masterFoad/NanoSage](https://github.com/masterFoad/NanoSage)
