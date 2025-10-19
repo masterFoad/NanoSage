@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 import os
+import asyncio
 import uvicorn
 from datetime import datetime
 
@@ -314,16 +315,10 @@ async def clear_history():
 
 @app.websocket("/ws/{query_id}")
 async def websocket_endpoint(websocket: WebSocket, query_id: str):
-    """
-    WebSocket endpoint for real-time query progress updates
-
-    Connect to this endpoint to receive real-time updates about query processing.
-    The server will send JSON messages with progress updates.
-    """
+    """WebSocket endpoint for real-time query progress updates"""
     await manager.connect(websocket, query_id)
 
     try:
-        # Send initial connection confirmation
         await websocket.send_json({
             "type": "connected",
             "query_id": query_id,
@@ -331,24 +326,20 @@ async def websocket_endpoint(websocket: WebSocket, query_id: str):
             "timestamp": datetime.utcnow().isoformat()
         })
 
-        # Send any buffered logs that were generated before the WebSocket connected
         buffered_logs = query_service.get_buffered_logs(query_id)
-        print(f"[WS-DEBUG] Sending {len(buffered_logs)} buffered logs on connect", flush=True)
         for log in buffered_logs:
             await websocket.send_json(log)
-        print(f"[WS-DEBUG] Finished sending buffered logs", flush=True)
 
-        # Keep connection alive and listen for messages
         while True:
-            # Wait for messages from client (e.g., ping/pong)
-            data = await websocket.receive_text()
-
-            # Echo back for ping/pong
-            if data == "ping":
-                await websocket.send_json({
-                    "type": "pong",
-                    "timestamp": datetime.utcnow().isoformat()
-                })
+            try:
+                data = await asyncio.wait_for(websocket.receive_text(), timeout=1.0)
+                if data == "ping":
+                    await websocket.send_json({
+                        "type": "pong",
+                        "timestamp": datetime.utcnow().isoformat()
+                    })
+            except asyncio.TimeoutError:
+                continue
 
     except WebSocketDisconnect:
         manager.disconnect(websocket)

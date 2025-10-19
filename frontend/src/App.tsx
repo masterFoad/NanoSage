@@ -43,7 +43,8 @@ const App: React.FC = () => {
       // Connect to WebSocket for real-time updates
       connectWebSocket(queryId);
 
-      // Start polling for results
+      // Fetch initial status (one-time only, no continuous polling)
+      // WebSocket will handle real-time updates
       pollQueryStatus(queryId);
     } catch (err: any) {
       console.error('Error submitting query:', err);
@@ -90,8 +91,12 @@ const App: React.FC = () => {
           wsRef.current.close();
         }
       } else if (!forceFetch) {
-        // Continue polling if not completed
-        setTimeout(() => pollQueryStatus(queryId), 2000);
+        // Only poll if WebSocket is not connected (fallback mechanism)
+        if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+          console.log('WebSocket not connected, falling back to polling');
+          setTimeout(() => pollQueryStatus(queryId), 2000);
+        }
+        // Otherwise, rely on WebSocket for updates
       }
     } catch (err: any) {
       console.error('Error fetching query status:', err);

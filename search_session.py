@@ -293,7 +293,7 @@ class SearchSession:
 
         print(f"[INFO] Initializing SearchSession for query_id={self.query_id}")
 
-        # Enhance the query via chain-of-thought.
+        self.loop = None
         self.enhanced_query = self.llm_manager.enhance_query(self.query)
         if not self.enhanced_query:
             self.enhanced_query = self.query
@@ -303,8 +303,7 @@ class SearchSession:
             model_choice=self.retrieval_model,
             device=self.device
         )
-        
-        # For vision models, also load a fast text model for web content
+
         self.text_model = None
         if self.model_type in ["siglip", "clip"]:
             from sentence_transformers import SentenceTransformer
@@ -318,11 +317,9 @@ class SearchSession:
         else:
             self.enhanced_query_embedding = embed_text(self.enhanced_query, self.model, self.processor, self.model_type, self.device)
 
-        # Create a knowledge base.
         print("[INFO] Creating KnowledgeBase...")
         self.kb = KnowledgeBase(self.model, self.processor, model_type=self.model_type, device=self.device, text_model=self.text_model)
 
-        # Load local corpus if available.
         self.corpus = []
         if self.corpus_dir:
             print(f"[INFO] Loading local documents from {self.corpus_dir}")
@@ -332,16 +329,15 @@ class SearchSession:
                 self.processor,
                 self.device,
                 self.model_type,
-                text_model=self.text_model  # Pass text_model for dimension consistency
+                text_model=self.text_model
             )
             self.corpus.extend(local_docs)
         self.kb.add_documents(self.corpus)
 
-        # Placeholders for web search results and TOC tree.
         self.web_results = []
         self.grouped_web_results = {}
         self.local_results = []
-        self.toc_tree = []  # List of TOCNode objects for the initial subqueries
+        self.toc_tree = []
         self.session_start_time = time.time()
 
     def _get_default_model(self, provider, rag_model):
@@ -356,42 +352,51 @@ class SearchSession:
             return "gemma2:2b"
 
     async def run_session(self):
-        """
-        Main entry point: perform recursive web search (if enabled) and then local retrieval.
-        """
+        """Main entry point: perform recursive web search (if enabled) and then local retrieval"""
+        self.loop = asyncio.get_running_loop()
+
         print(f"[INFO] Starting session with query_id={self.query_id}, max_depth={self.max_depth}")
         plain_enhanced_query = clean_search_query(self.enhanced_query)
 
-        # 1) Generate subqueries from the enhanced query
         initial_subqueries = split_query(plain_enhanced_query, max_len=self.config.get("max_query_length", 200))
         print(f"[INFO] Generated {len(initial_subqueries)} initial subqueries from the enhanced query.")
 
-        # 2) Optionally do a Monte Carlo approach to sample subqueries
         if self.config.get("monte_carlo_search", True):
             print("[INFO] Using Monte Carlo approach to sample subqueries.")
             initial_subqueries = self.perform_monte_carlo_subqueries(plain_enhanced_query, initial_subqueries)
 
-        # 3) If web search is enabled and max_depth >= 1, do the recursive expansion
         if self.web_search_enabled and self.max_depth >= 1:
             web_results, web_entries, grouped, toc_nodes = await self.perform_recursive_web_searches(initial_subqueries, current_depth=1)
             self.web_results = web_results
             self.grouped_web_results = grouped
             self.toc_tree = toc_nodes
-            # Add new entries to the knowledge base
             self.corpus.extend(web_entries)
             self.kb.add_documents(web_entries)
         else:
             print("[INFO] Web search is disabled or max_depth < 1, skipping web expansion.")
 
-        # 4) Local retrieval
         print(f"[INFO] Retrieving top {self.top_k} local documents for final answer.")
         self.local_results = self.kb.search(self.enhanced_query, top_k=self.top_k)
 
-        # 5) Summaries and final RAG generation
-        summarized_web = self._summarize_web_results(self.web_results)
-        summarized_local = self._summarize_local_results(self.local_results)
-        final_answer = self._build_final_answer(summarized_web, summarized_local)
+        summarized_web = await self.loop.run_in_executor(
+            None,
+            self._summarize_web_results,
+            self.web_results
+        )
+        summarized_local = await self.loop.run_in_executor(
+            None,
+            self._summarize_local_results,
+            self.local_results
+        )
+
+        final_answer = await self.loop.run_in_executor(
+            None,
+            self._build_final_answer,
+            summarized_web,
+            summarized_local
+        )
         print("[INFO] Finished building final advanced report.")
+
         return final_answer
 
     def perform_monte_carlo_subqueries(self, parent_query, subqueries):
@@ -546,7 +551,12 @@ class SearchSession:
                     else:
                         # all-MiniLM or other text models
                         emb = self.model.encode(limited_text, convert_to_tensor=True)
-                    
+
+                    # Validate embedding
+                    if emb is None or (hasattr(emb, 'numel') and emb.numel() == 0):
+                        print(f"[WARN] Empty embedding generated for '{url}', skipping...")
+                        continue
+
                     entry = {
                         "embedding": emb,
                         "metadata": {
@@ -563,18 +573,31 @@ class SearchSession:
                     }
                     branch_corpus_entries.append(entry)
                     branch_web_results.append({
-                        "url": url, 
+                        "url": url,
                         "snippet": snippet,
                         "title": meta.get("title", ""),
                         "source_engine": meta.get("source_engine", "unknown")
                     })
                 except Exception as e:
                     print(f"[WARN] Error embedding page '{url}': {e}")
+                    import traceback
+                    print(f"[DEBUG] Traceback: {traceback.format_exc()}")
 
-            # Summarize and update metrics
+            # Summarize and update metrics (run in executor to keep event loop responsive)
             branch_snippets = " ".join([r.get("snippet", "") for r in branch_web_results])
             summary_start = time.time()
-            toc_node.summary = self.llm_manager.summarize_text(branch_snippets)
+
+            # Run LLM summarization in thread executor
+            if self.loop:
+                toc_node.summary = await self.loop.run_in_executor(
+                    None,
+                    self.llm_manager.summarize_text,
+                    branch_snippets
+                )
+            else:
+                # Fallback if loop not available (shouldn't happen in normal flow)
+                toc_node.summary = self.llm_manager.summarize_text(branch_snippets)
+
             summary_end = time.time()
             toc_node.timestamps['summary_generated'] = datetime.now().isoformat()
             toc_node.metrics['processing_time_ms'] += int((summary_end - summary_start) * 1000)
@@ -588,7 +611,16 @@ class SearchSession:
 
             additional_subqueries = []
             if current_depth < self.max_depth:
-                additional_query = self.llm_manager.enhance_query(sq_clean)
+                # Run query enhancement in executor to keep event loop responsive
+                if self.loop:
+                    additional_query = await self.loop.run_in_executor(
+                        None,
+                        self.llm_manager.enhance_query,
+                        sq_clean
+                    )
+                else:
+                    additional_query = self.llm_manager.enhance_query(sq_clean)
+
                 if additional_query and additional_query != sq_clean:
                     additional_subqueries = split_query(additional_query, max_len=self.config.get("max_query_length", 200))
 

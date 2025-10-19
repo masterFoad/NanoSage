@@ -9,11 +9,10 @@ import asyncio
 class ConnectionManager:
     """Manages WebSocket connections for real-time updates"""
 
-    def __init__(self):
-        # Map of query_id -> set of WebSocket connections
+    def __init__(self, debug: bool = False):
         self.active_connections: Dict[str, Set[WebSocket]] = {}
-        # Map of WebSocket -> query_id for cleanup
         self.connection_queries: Dict[WebSocket, str] = {}
+        self.debug = debug
 
     async def connect(self, websocket: WebSocket, query_id: str):
         """Accept a new WebSocket connection for a query"""
@@ -25,8 +24,9 @@ class ConnectionManager:
         self.active_connections[query_id].add(websocket)
         self.connection_queries[websocket] = query_id
 
-        from datetime import datetime
-        print(f"[WebSocket] Client connected for query: {query_id} at {datetime.now().strftime('%H:%M:%S.%f')}", flush=True)
+        if self.debug:
+            from datetime import datetime
+            print(f"[WebSocket] Client connected: {query_id}", flush=True)
 
     def disconnect(self, websocket: WebSocket):
         """Remove a WebSocket connection"""
@@ -35,35 +35,27 @@ class ConnectionManager:
 
             if query_id in self.active_connections:
                 self.active_connections[query_id].discard(websocket)
-
-                # Clean up empty query connection sets
                 if len(self.active_connections[query_id]) == 0:
                     del self.active_connections[query_id]
 
             del self.connection_queries[websocket]
-            print(f"[WebSocket] Client disconnected from query: {query_id}")
+
+            if self.debug:
+                print(f"[WebSocket] Client disconnected: {query_id}")
 
     async def send_progress_update(self, query_id: str, message: dict):
-        """
-        Send a progress update to all clients listening to a query
-
-        Args:
-            query_id: The query ID
-            message: Progress update message (will be JSON serialized)
-        """
+        """Send a progress update to all clients listening to a query"""
         if query_id not in self.active_connections:
-            from datetime import datetime
-            print(f"[WS-DEBUG] No connection for {query_id[:8]} at {datetime.now().strftime('%H:%M:%S.%f')}", flush=True)
+            if self.debug:
+                print(f"[WS-DEBUG] No connection for {query_id[:8]}", flush=True)
             return
 
-        # Convert message to JSON
         json_message = json.dumps(message)
 
-        from datetime import datetime
-        msg_preview = message.get('message', '')[:50] if isinstance(message, dict) else str(message)[:50]
-        print(f"[WS-DEBUG] Sending to {len(self.active_connections[query_id])} clients at {datetime.now().strftime('%H:%M:%S.%f')}: {msg_preview}", flush=True)
+        if self.debug:
+            msg_preview = message.get('message', '')[:50] if isinstance(message, dict) else str(message)[:50]
+            print(f"[WS-DEBUG] Sending to {len(self.active_connections[query_id])} clients: {msg_preview}", flush=True)
 
-        # Send to all connected clients
         disconnected = set()
         for connection in self.active_connections[query_id]:
             try:
@@ -72,28 +64,15 @@ class ConnectionManager:
                 print(f"[WebSocket] Error sending message: {e}")
                 disconnected.add(connection)
 
-        # Clean up disconnected clients
         for connection in disconnected:
             self.disconnect(connection)
 
     async def send_log(self, query_id: str, log_message: dict):
-        """
-        Send a log message to all clients listening to a query
-
-        Args:
-            query_id: The query ID
-            log_message: Log message (will be JSON serialized)
-        """
-        # Use the same method as progress updates
+        """Send a log message to all clients listening to a query"""
         await self.send_progress_update(query_id, log_message)
 
     async def broadcast(self, message: dict):
-        """
-        Broadcast a message to all connected clients
-
-        Args:
-            message: Message to broadcast (will be JSON serialized)
-        """
+        """Broadcast a message to all connected clients"""
         json_message = json.dumps(message)
 
         for query_id, connections in self.active_connections.items():
@@ -105,7 +84,6 @@ class ConnectionManager:
                     print(f"[WebSocket] Error broadcasting: {e}")
                     disconnected.add(connection)
 
-            # Clean up disconnected clients
             for connection in disconnected:
                 self.disconnect(connection)
 
