@@ -30,3 +30,6 @@ ollama
 # Tavily Search API
 langchain-tavily
 python-dotenv
+
+# UI
+streamlit

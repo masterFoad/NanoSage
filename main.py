@@ -29,6 +29,9 @@ def main():
     parser.add_argument("--llm_model", type=str, default=None, help="Specific LLM model to use (overrides provider default)")
     parser.add_argument("--web_concurrency", type=int, default=8, help="Concurrent web downloads")
     parser.add_argument("--include_wikipedia", action="store_true", help="Include Wikipedia in web search")
+    parser.add_argument("--faiss_index_path", type=str, default=None, help="Path to FAISS index file")
+    parser.add_argument("--faiss_meta_path", type=str, default=None, help="Path to FAISS metadata JSONL file")
+    parser.add_argument("--faiss_root_dir", type=str, default=None, help="Root directory containing FAISS index/meta pairs")
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -51,7 +54,10 @@ def main():
         rag_model=args.rag_model,
         max_depth=args.max_depth,
         llm_provider=args.llm_provider,
-        llm_model=args.llm_model
+        llm_model=args.llm_model,
+        faiss_index_path=args.faiss_index_path,
+        faiss_meta_path=args.faiss_meta_path,
+        faiss_root_dir=args.faiss_root_dir
     )
 
     loop = asyncio.get_event_loop()

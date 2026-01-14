@@ -1,5 +1,6 @@
 import os
 import io
+import json
 import torch
 import numpy as np
 import fitz  # PyMuPDF
@@ -62,6 +63,46 @@ def load_retrieval_model(model_choice="colpali", device="cpu"):
         raise ValueError(f"Unsupported retrieval model choice: {model_choice}")
 
     return model, processor, model_type
+
+
+def load_faiss_index(index_path: str, meta_path: str):
+    if not index_path or not meta_path:
+        raise ValueError("Both index_path and meta_path are required to load a FAISS index.")
+    if not os.path.isfile(index_path):
+        raise FileNotFoundError(f"FAISS index file not found: {index_path}")
+    if not os.path.isfile(meta_path):
+        raise FileNotFoundError(f"FAISS metadata file not found: {meta_path}")
+    try:
+        import faiss
+    except ImportError as exc:
+        raise ImportError("faiss is required to load FAISS indexes. Install faiss-cpu.") from exc
+
+    index = faiss.read_index(index_path)
+    metadata = []
+    with open(meta_path, "r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            if not line.strip():
+                continue
+            try:
+                metadata.append(json.loads(line))
+            except json.JSONDecodeError as exc:
+                print(f"[WARN] Skipping malformed JSONL line {line_no} in {meta_path}: {exc}")
+    return index, metadata
+
+
+def find_faiss_pairs(root_dir: str, index_name: str = "index.faiss", meta_name: str = "meta.jsonl"):
+    if not root_dir:
+        return []
+    if not os.path.isdir(root_dir):
+        raise FileNotFoundError(f"FAISS root directory not found: {root_dir}")
+
+    pairs = []
+    for dirpath, _, filenames in os.walk(root_dir):
+        if index_name in filenames and meta_name in filenames:
+            pairs.append(
+                (os.path.join(dirpath, index_name), os.path.join(dirpath, meta_name))
+            )
+    return pairs
 
 
 def _l2norm(x: torch.Tensor) -> torch.Tensor:

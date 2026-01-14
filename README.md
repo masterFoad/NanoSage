@@ -104,6 +104,24 @@ python main.py --query "artificial intelligence" --retrieval_model all-minilm --
 python main.py --query "research papers" --corpus_dir ./my_documents --retrieval_model colpali
 ```
 
+### ✅ Easy UI (No Command Line)
+
+If you prefer a simple UI, use the Streamlit app:
+
+1. **Install dependencies** (one time):
+   ```bash
+   pip install -r requirements.txt
+   ```
+2. **Double-click** `start_ui.bat` (Windows) to launch the UI.
+3. A browser window will open with the NanoSage UI.
+
+The UI lets you select:
+- Query text
+- FAISS root folder or a single index/meta pair
+- Retrieval model (must match your index embedding model)
+
+**Note for Windows users:** The UI launcher prefers Python 3.10/3.11. If you installed Python 3.13+ (e.g., 3.14) and see `%1 is not a valid Win32 application`, install Python 3.11 and try again. The launcher will skip Python 3.13+ on PATH and fall back automatically if other versions are installed.
+
 **Parameters**:
 - `--query`: Main search query (natural language).
 - `--web_search`: Enables web-based retrieval via Tavily API.
@@ -162,6 +180,29 @@ python main.py --query "AI in finance" \
 ```
 
 Now the system searches **both** local docs and web data (if `--web_search` is enabled).
+
+#### ✅ Using a FAISS Index (index.faiss + meta.jsonl)
+
+If you already have FAISS indexes and JSONL metadata (one line per document), you can load them directly:
+
+```bash
+pip install faiss-cpu
+
+python main.py --query "contract law precedents" \
+               --faiss_index_path "C:\path\to\index.faiss" \
+               --faiss_meta_path "C:\path\to\meta.jsonl" \
+               --retrieval_model all-minilm
+```
+
+Make sure the FAISS index was built with embeddings from the same retrieval model you select (e.g., `all-minilm`). The metadata lines should include `file_path` and optional `snippet` fields for best report output.
+
+If you have many year/court folders, point to a root directory that contains multiple `index.faiss` + `meta.jsonl` pairs and NanoSage will load them all:
+
+```bash
+python main.py --query "contract law precedents" \
+               --faiss_root_dir "C:\Users\vasil\Desktop\Ai project\_INDEX" \
+               --retrieval_model all-minilm
+```
 
 #### 🔄 RAG with Gemma 2B
 

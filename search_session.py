@@ -10,7 +10,15 @@ import yaml
 import torch
 from datetime import datetime
 
-from knowledge_base import KnowledgeBase, late_interaction_score, load_corpus_from_dir, load_retrieval_model, embed_text
+from knowledge_base import (
+    KnowledgeBase,
+    late_interaction_score,
+    load_corpus_from_dir,
+    find_faiss_pairs,
+    load_faiss_index,
+    load_retrieval_model,
+    embed_text,
+)
 from web_crawler import search_and_download, parse_any_to_text, sanitize_filename
 import json
 from aggregator import aggregate_results
@@ -262,7 +270,8 @@ def save_toc_to_json(toc_nodes, output_path, include_analytics=True):
 class SearchSession:
     def __init__(self, query, config, corpus_dir=None, device="cpu",
                  retrieval_model="colpali", top_k=3, web_search_enabled=False,
-                 personality=None, rag_model="gemma", max_depth=1, llm_provider="ollama", llm_model=None):
+                 personality=None, rag_model="gemma", max_depth=1, llm_provider="ollama", llm_model=None,
+                 faiss_index_path=None, faiss_meta_path=None, faiss_root_dir=None):
         """
         :param max_depth: Maximum recursion depth for subquery expansion.
         :param llm_provider: LLM provider to use ("ollama", "openai", "anthropic")
@@ -278,6 +287,9 @@ class SearchSession:
         self.personality = personality
         self.rag_model = rag_model
         self.max_depth = max_depth
+        self.faiss_index_path = faiss_index_path
+        self.faiss_meta_path = faiss_meta_path
+        self.faiss_root_dir = faiss_root_dir
         
         # Initialize LLM manager
         llm_config = {
@@ -330,6 +342,34 @@ class SearchSession:
             self.corpus.extend(local_docs)
         self.kb.add_documents(self.corpus)
 
+        self.faiss_indexes = []
+        if self.faiss_root_dir and (self.faiss_index_path or self.faiss_meta_path):
+            raise ValueError("Provide either faiss_root_dir or faiss_index_path/faiss_meta_path, not both.")
+        if self.faiss_root_dir:
+            pairs = find_faiss_pairs(self.faiss_root_dir)
+            if not pairs:
+                raise FileNotFoundError(f"No FAISS index pairs found under: {self.faiss_root_dir}")
+            print(f"[INFO] Loading {len(pairs)} FAISS index pair(s) from {self.faiss_root_dir}")
+            for index_path, meta_path in pairs:
+                index, metadata = load_faiss_index(index_path, meta_path)
+                self.faiss_indexes.append({
+                    "index": index,
+                    "metadata": metadata,
+                    "index_path": index_path,
+                    "meta_path": meta_path
+                })
+        elif self.faiss_index_path or self.faiss_meta_path:
+            if not (self.faiss_index_path and self.faiss_meta_path):
+                raise ValueError("Both faiss_index_path and faiss_meta_path must be provided together.")
+            print(f"[INFO] Loading FAISS index from {self.faiss_index_path}")
+            index, metadata = load_faiss_index(self.faiss_index_path, self.faiss_meta_path)
+            self.faiss_indexes.append({
+                "index": index,
+                "metadata": metadata,
+                "index_path": self.faiss_index_path,
+                "meta_path": self.faiss_meta_path
+            })
+
         # Placeholders for web search results and TOC tree.
         self.web_results = []
         self.grouped_web_results = {}
@@ -378,7 +418,10 @@ class SearchSession:
 
         # 4) Local retrieval
         print(f"[INFO] Retrieving top {self.top_k} local documents for final answer.")
-        self.local_results = self.kb.search(self.enhanced_query, top_k=self.top_k)
+        if self.faiss_indexes:
+            self.local_results = self._search_faiss(self.enhanced_query, top_k=self.top_k)
+        else:
+            self.local_results = self.kb.search(self.enhanced_query, top_k=self.top_k)
 
         # 5) Summaries and final RAG generation
         summarized_web = self._summarize_web_results(self.web_results)
@@ -386,6 +429,61 @@ class SearchSession:
         final_answer = self._build_final_answer(summarized_web, summarized_local)
         print("[INFO] Finished building final advanced report.")
         return final_answer
+
+    def _search_faiss(self, query, top_k=3):
+        if self.model_type in ["siglip", "clip"] and self.text_model:
+            query_embedding = self.text_model.encode(query, convert_to_tensor=True)
+        else:
+            query_embedding = embed_text(query, self.model, self.processor, self.model_type, self.device)
+        query_vector = query_embedding.detach().cpu().numpy().astype("float32").reshape(1, -1)
+        results = []
+        for entry in self.faiss_indexes:
+            index = entry["index"]
+            metadata = entry["metadata"]
+            if getattr(index, "d", None) != query_vector.shape[1]:
+                raise RuntimeError(
+                    "Embedding dim mismatch: index.d="
+                    f"{getattr(index, 'd', 'unknown')} but query embedding dim={query_vector.shape[1]} "
+                    f"for index {entry['index_path']}. "
+                    "Fix: run with the SAME embedding model used to build the index "
+                    "(e.g., set --retrieval_model to the model used during indexing)."
+                )
+            distances, indices = index.search(query_vector, top_k)
+            metric_type = getattr(index, "metric_type", None)
+            if metric_type is None:
+                sort_multiplier = -1.0
+            else:
+                try:
+                    import faiss
+                except ImportError:
+                    faiss = None
+                if faiss and metric_type == faiss.METRIC_L2:
+                    sort_multiplier = 1.0
+                else:
+                    sort_multiplier = -1.0
+
+            for rank, idx in enumerate(indices[0]):
+                if idx < 0 or idx >= len(metadata):
+                    continue
+                meta = metadata[idx] or {}
+                snippet = meta.get("snippet") or meta.get("text_preview") or ""
+                score = float(distances[0][rank])
+                results.append({
+                    "embedding": query_embedding,
+                    "metadata": {
+                        "file_path": meta.get("file_path") or meta.get("path", ""),
+                        "type": meta.get("type", "faiss"),
+                        "snippet": snippet,
+                        "score": score,
+                        "index_path": entry["index_path"]
+                    },
+                    "_sort_score": score * sort_multiplier
+                })
+
+        results.sort(key=lambda item: item.get("_sort_score", 0.0), reverse=True)
+        for item in results:
+            item.pop("_sort_score", None)
+        return results[:top_k]
 
     def perform_monte_carlo_subqueries(self, parent_query, subqueries):
         """
