@@ -37,3 +37,14 @@ This branch addresses the first practical slice from the oh-my-review phase-minu
 - Add end-to-end smoke tests with mocked web crawler and mocked LLM manager.
 - Decide whether the legacy `web_search.py` path should be deleted, deprecated, or covered with parity tests.
 - Add lightweight benchmark fixtures for retrieval latency and recursive traversal depth.
+- Extend the new evidence ledger into a full claim ledger with contradiction mining.
+
+## Evidence-guided search branch
+
+The follow-up `upgrade/evidence-guided-search` branch adds the first algorithmic
+slice on top of this audit response:
+
+- `EvidenceItem` / `Claim` shells for source-grounded synthesis.
+- MMR-style query diversity reranking.
+- Priority-queue branch exploration scored by relevance, novelty, and depth.
+- `evidence_ledger.json` persistence alongside TOC/report artifacts.

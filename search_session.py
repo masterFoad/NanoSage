@@ -2,15 +2,18 @@
 
 import uuid
 import asyncio
+import heapq
 import time
 import re
 import random
+from dataclasses import asdict
 from datetime import datetime, timezone
 
 from knowledge_base import KnowledgeBase, late_interaction_score, load_corpus_from_dir, load_retrieval_model, embed_text
 from web_crawler import search_and_download, parse_any_to_text, sanitize_filename
 import json
 from aggregator import aggregate_results
+from evidence import SearchBranch, make_evidence_item, mmr_rerank, novelty_against
 from path_utils import ensure_dir_under, safe_resolve_under
 
 #############################################
@@ -368,6 +371,7 @@ class SearchSession:
 
         # Placeholders for web search results and TOC tree.
         self.web_results = []
+        self.evidence_items = []
         self.grouped_web_results = {}
         self.local_results = []
         self.toc_tree = []  # List of TOCNode objects for the initial subqueries
@@ -468,60 +472,103 @@ class SearchSession:
         print(f"[DEBUG] Monte Carlo metrics: avg_candidate_score={monte_carlo_metrics['avg_candidate_score']:.3f}, avg_selected_score={monte_carlo_metrics['avg_selected_score']:.3f}")
         return chosen_sqs
 
+    def _score_subqueries(self, subqueries, depth=1, parent_query=None, explored_queries=None):
+        """Create relevance/novelty-scored search branches from raw subqueries."""
+        seen = set()
+        scored = []
+        for sq in subqueries:
+            sq_clean = clean_search_query(sq)
+            if not sq_clean or sq_clean in seen:
+                continue
+            seen.add(sq_clean)
+            node_embedding = embed_text(sq_clean, self.model, self.processor, self.model_type, self.device)
+            relevance = late_interaction_score(self.enhanced_query_embedding, node_embedding)
+            scored.append((sq_clean, relevance))
+
+        ranked = mmr_rerank(scored, lambda_relevance=self.config.get("branch_mmr_lambda", 0.72))
+        explored_queries = explored_queries or []
+        branches = []
+        selected_for_novelty = list(explored_queries)
+        for query, relevance in ranked:
+            novelty = novelty_against(query, selected_for_novelty)
+            selected_for_novelty.append(query)
+            branches.append(SearchBranch(query=query, depth=depth, relevance=relevance, parent_query=parent_query, novelty=novelty))
+        return branches
+
+    def _push_branch(self, frontier, branch, counter):
+        heapq.heappush(frontier, (-branch.priority, counter, branch))
+        return counter + 1
+
     async def perform_recursive_web_searches(self, subqueries, current_depth=1, parent_query=None):
         """
-        Recursively perform web searches for each subquery up to self.max_depth.
-        Returns:
-          aggregated_web_results, aggregated_corpus_entries, grouped_results, toc_nodes
+        Perform evidence-guided branch search up to self.max_depth.
+
+        This keeps the public return contract of the old recursive method, but
+        explores a priority queue of relevant/novel branches instead of blindly
+        walking depth-first in input order.
         """
         aggregated_web_results = []
         aggregated_corpus_entries = []
-        toc_nodes = []
+        root_nodes = []
+        node_by_query = {}
+        explored_queries = []
+        frontier = []
+        counter = 0
         min_relevance = self.config.get("min_relevance", 0.5)
+        max_branches = int(self.config.get("max_branches", 100))
 
-        for sq in subqueries:
-            sq_clean = clean_search_query(sq)
-            if not sq_clean:
+        for branch in self._score_subqueries(subqueries, current_depth, parent_query):
+            counter = self._push_branch(frontier, branch, counter)
+
+        while frontier and len(explored_queries) < max_branches:
+            _, _, branch = heapq.heappop(frontier)
+            sq_clean = branch.query
+            if sq_clean in node_by_query:
                 continue
 
             # Create a TOC node with enhanced tracking
-            toc_node = TOCNode(query_text=sq_clean, depth=current_depth)
+            toc_node = TOCNode(query_text=sq_clean, depth=branch.depth)
             toc_node.node_id = str(uuid.uuid4())[:8]
             toc_node.mark_timestamp('created')
-            toc_node.parent_query = parent_query if parent_query else self.query
-            
-            # Relevance calculation with similarity tracking
-            node_embedding = embed_text(sq_clean, self.model, self.processor, self.model_type, self.device)
-            relevance = late_interaction_score(self.enhanced_query_embedding, node_embedding)
-            toc_node.relevance_score = relevance
-            toc_node.add_similarity_score(relevance)
-            
+            toc_node.parent_query = branch.parent_query if branch.parent_query else self.query
+            toc_node.relevance_score = branch.relevance
+            toc_node.add_similarity_score(branch.relevance)
+            toc_node.metrics['branch_priority'] = round(branch.priority, 6)
+            toc_node.metrics['branch_novelty'] = round(branch.novelty, 6)
+
             # Check if this node was selected by Monte Carlo
             if hasattr(self, 'monte_carlo_metrics') and sq_clean in self.monte_carlo_metrics.get('selected_queries', []):
                 toc_node.metrics['monte_carlo_selected'] = True
                 toc_node.metrics['monte_carlo_weight'] = self.monte_carlo_metrics.get('selected_weights_by_query', {}).get(sq_clean, 0.0)
 
-            if relevance < min_relevance:
-                print(f"[INFO] Skipping branch '{sq_clean}' due to low relevance ({relevance:.2f} < {min_relevance}).")
+            if branch.relevance < min_relevance:
+                print(f"[INFO] Skipping branch '{sq_clean}' due to low relevance ({branch.relevance:.2f} < {min_relevance}).")
                 continue
+
+            node_by_query[sq_clean] = toc_node
+            if branch.parent_query and branch.parent_query in node_by_query:
+                node_by_query[branch.parent_query].add_child(toc_node)
+            else:
+                root_nodes.append(toc_node)
+            explored_queries.append(sq_clean)
 
             # Create subdirectory
             safe_subquery = sanitize_filename(sq_clean)[:30]
             subquery_dir = str(ensure_dir_under(self.base_result_dir, f"web_{safe_subquery}"))
-            print(f"[DEBUG] Searching web for subquery '{sq_clean}' at depth={current_depth}...")
+            print(f"[DEBUG] Searching web for subquery '{sq_clean}' at depth={branch.depth} priority={branch.priority:.3f}...")
 
             # Track web search timing
             toc_node.mark_timestamp('web_search_start')
             web_search_start = time.time()
-            
+
             pages = await search_and_download(
-                keyword=sq_clean, 
+                keyword=sq_clean,
                 out_dir=subquery_dir,
                 top_n=self.config.get("web_search_limit", 5),
                 concurrency=self.config.get("web_concurrency", 8),
                 include_wikipedia=self.config.get("include_wikipedia", False)
             )
-            
+
             web_search_end = time.time()
             toc_node.mark_timestamp('web_search_end')
             toc_node.metrics['processing_time_ms'] += int((web_search_end - web_search_start) * 1000)
@@ -535,22 +582,25 @@ class SearchSession:
                 meta = page.get("meta", {})
                 if not file_path or not url:
                     continue
-                
+
                 # Use the web crawler's robust parsing function
                 raw_text = parse_any_to_text(file_path)
                 if not raw_text.strip():
                     continue
-                
+
                 # Use metadata from sidecar JSON if available, otherwise create snippet
                 snippet = meta.get("text_preview", raw_text[:100].replace('\n', ' ') + "...")
                 limited_text = raw_text[:2048]
-                
+
                 try:
                     emb = embed_text(limited_text, self.model, self.processor, self.model_type, self.device)
-                    
+                    evidence = make_evidence_item(page, meta, sq_clean, snippet)
+                    self.evidence_items.append(evidence)
+
                     entry = {
                         "embedding": emb,
                         "metadata": {
+                            "evidence_id": evidence.evidence_id,
                             "file_path": file_path,
                             "type": "webhtml",
                             "snippet": snippet,
@@ -564,7 +614,8 @@ class SearchSession:
                     }
                     branch_corpus_entries.append(entry)
                     branch_web_results.append({
-                        "url": url, 
+                        "evidence_id": evidence.evidence_id,
+                        "url": url,
                         "snippet": snippet,
                         "title": meta.get("title", ""),
                         "source_engine": meta.get("source_engine", "unknown")
@@ -579,7 +630,7 @@ class SearchSession:
             summary_end = time.time()
             toc_node.mark_timestamp('summary_generated')
             toc_node.metrics['processing_time_ms'] += int((summary_end - summary_start) * 1000)
-            
+
             # Update content metrics
             toc_node.web_results = branch_web_results
             toc_node.corpus_entries = branch_corpus_entries
@@ -588,25 +639,27 @@ class SearchSession:
             toc_node.metrics['total_content_length'] = sum(len(r.get("snippet", "")) for r in branch_web_results)
 
             additional_subqueries = []
-            if current_depth < self.max_depth:
+            if branch.depth < self.max_depth:
                 additional_query = await asyncio.to_thread(self.llm_manager.enhance_query, sq_clean)
                 if additional_query and additional_query != sq_clean:
                     additional_subqueries = split_query(additional_query, max_len=self.config.get("max_query_length", 200))
 
             if additional_subqueries:
-                toc_node.metrics['subquery_expansion_count'] = len(additional_subqueries)
-                deeper_web_results, deeper_corpus_entries, _, deeper_toc_nodes = await self.perform_recursive_web_searches(additional_subqueries, current_depth=current_depth+1, parent_query=sq_clean)
-                branch_web_results.extend(deeper_web_results)
-                branch_corpus_entries.extend(deeper_corpus_entries)
-                for child_node in deeper_toc_nodes:
-                    toc_node.add_child(child_node)
+                child_branches = self._score_subqueries(
+                    additional_subqueries,
+                    depth=branch.depth + 1,
+                    parent_query=sq_clean,
+                    explored_queries=explored_queries,
+                )
+                toc_node.metrics['subquery_expansion_count'] = len(child_branches)
+                for child_branch in child_branches:
+                    counter = self._push_branch(frontier, child_branch, counter)
 
             # Mark node as completed
             toc_node.mark_timestamp('completed')
-            
+
             aggregated_web_results.extend(branch_web_results)
             aggregated_corpus_entries.extend(branch_corpus_entries)
-            toc_nodes.append(toc_node)
 
         # Group results by domain for reporting
         grouped = {}
@@ -618,13 +671,14 @@ class SearchSession:
                 if domain not in grouped:
                     grouped[domain] = []
                 grouped[domain].append({
-                    "url": url, 
-                    "file_path": e["metadata"]["file_path"], 
+                    "evidence_id": r.get("evidence_id") or e["metadata"].get("evidence_id", ""),
+                    "url": url,
+                    "file_path": e["metadata"]["file_path"],
                     "content_type": e["metadata"].get("content_type", ""),
                     "title": r.get("title", ""),
                     "source_engine": r.get("source_engine", "unknown")
                 })
-        return aggregated_web_results, aggregated_corpus_entries, grouped, toc_nodes
+        return aggregated_web_results, aggregated_corpus_entries, grouped, root_nodes
 
     def _summarize_web_results(self, web_results):
         lines = []
@@ -702,6 +756,15 @@ Report:
                 print(f"[INFO] TOC analysis saved to: {toc_json_path}")
             except Exception as e:
                 print(f"[WARN] Failed to save TOC JSON: {e}")
+
+        if self.evidence_items:
+            evidence_path = safe_resolve_under(self.base_result_dir, "evidence_ledger.json")
+            try:
+                with open(evidence_path, "w", encoding="utf-8") as f:
+                    json.dump([asdict(item) for item in self.evidence_items], f, indent=2, ensure_ascii=False)
+                print(f"[INFO] Evidence ledger saved to: {evidence_path}")
+            except Exception as e:
+                print(f"[WARN] Failed to save evidence ledger: {e}")
         
         return aggregate_results(
             self.query_id,

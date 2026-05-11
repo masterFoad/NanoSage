@@ -174,6 +174,13 @@ export NANOSAGE_ANTHROPIC_MODEL=claude-haiku-4-5-20251001
 Retrieval defaults now prefer `siglip`, with embedding compatibility checks to
 prevent mixed-dimension retrieval states.
 
+Branch exploration is now evidence-guided: candidate subqueries are scored by
+relevance, reranked with MMR-style diversity, then explored from a priority
+queue. Tune with:
+
+- `branch_mmr_lambda`: higher favors relevance; lower favors diversity.
+- `max_branches`: caps total web branches explored in one session.
+
 #### ✅ Using Local Files
 
 If you have local PDFs, text files, or images:

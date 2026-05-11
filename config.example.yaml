@@ -12,6 +12,8 @@ include_wikipedia: false
 max_depth: 1
 max_query_length: 200
 min_relevance: 0.5
+max_branches: 100
+branch_mmr_lambda: 0.72
 monte_carlo_search: true
 monte_carlo_samples: 3
 rag_model: gemma
