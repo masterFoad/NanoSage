@@ -1,25 +1,27 @@
 # search_session.py
 
-import os
 import uuid
 import asyncio
 import time
 import re
 import random
-import yaml
-import torch
-from datetime import datetime
+from datetime import datetime, timezone
 
 from knowledge_base import KnowledgeBase, late_interaction_score, load_corpus_from_dir, load_retrieval_model, embed_text
 from web_crawler import search_and_download, parse_any_to_text, sanitize_filename
 import json
 from aggregator import aggregate_results
+from path_utils import ensure_dir_under, safe_resolve_under
 
 #############################################
 # LLM Interface - Modular provider system
 #############################################
 
-from llm_interface import LLMManager, create_llm_manager
+from llm_interface import create_llm_manager, default_model_for_provider
+
+
+def utc_now_iso():
+    return datetime.now(timezone.utc).isoformat()
 
 def clean_search_query(query):
     query = re.sub(r'[\*\_`]', '', query)
@@ -45,6 +47,41 @@ def split_query(query, max_len=200):
     if current:
         subqueries.append(current)
     return [sq for sq in subqueries if sq.strip()]
+
+
+def monte_carlo_sampling_weights(scores):
+    """Return non-negative sampling weights for arbitrary similarity scores."""
+    if not scores:
+        return []
+    min_score = min(scores)
+    shifted = [(score - min_score) + 1e-6 for score in scores]
+    if sum(shifted) <= 0:
+        return [1.0 for _ in scores]
+    return shifted
+
+
+def weighted_sample_without_replacement(items, weights, k):
+    """Small deterministic-bound weighted sampler that never duplicates items."""
+    if k <= 0 or not items:
+        return []
+    remaining = list(zip(items, weights))
+    chosen = []
+    for _ in range(min(k, len(remaining))):
+        total = sum(max(weight, 0.0) for _, weight in remaining)
+        if total <= 0:
+            idx = random.randrange(len(remaining))
+        else:
+            pick = random.uniform(0, total)
+            cumulative = 0.0
+            idx = len(remaining) - 1
+            for i, (_, weight) in enumerate(remaining):
+                cumulative += max(weight, 0.0)
+                if cumulative >= pick:
+                    idx = i
+                    break
+        item, _ = remaining.pop(idx)
+        chosen.append(item)
+    return chosen
 
 ##############################################
 # TOC Node: Represents a branch in the search tree
@@ -87,6 +124,11 @@ class TOCNode:
     def add_child(self, child_node):
         self.children.append(child_node)
         child_node.parent_query = self.query_text
+
+    def mark_timestamp(self, name):
+        if name not in self.timestamps:
+            raise KeyError(f"Unknown timestamp field: {name}")
+        self.timestamps[name] = utc_now_iso()
 
     def to_dict(self):
         """Convert TOCNode to dictionary for JSON serialization"""
@@ -288,8 +330,8 @@ class SearchSession:
         self.llm_manager = create_llm_manager(**llm_config)
 
         self.query_id = str(uuid.uuid4())[:8]
-        self.base_result_dir = os.path.join(self.config.get("results_base_dir", "results"), self.query_id)
-        os.makedirs(self.base_result_dir, exist_ok=True)
+        self.results_base_dir = self.config.get("results_base_dir", "results")
+        self.base_result_dir = str(ensure_dir_under(self.results_base_dir, self.query_id))
 
         print(f"[INFO] Initializing SearchSession for query_id={self.query_id}")
 
@@ -304,19 +346,13 @@ class SearchSession:
             device=self.device
         )
         
-        # For vision models, also load a fast text model for web content
+        # Keep a single retrieval vector space per session. Earlier hybrid
+        # MiniLM-for-text + SigLIP/CLIP-for-vision paths could mix dimensions.
         self.text_model = None
-        if self.model_type in ["siglip", "clip"]:
-            from sentence_transformers import SentenceTransformer
-            self.text_model = SentenceTransformer("all-MiniLM-L6-v2", device=self.device)
 
         # Compute the overall enhanced query embedding once.
         print("[INFO] Computing embedding for enhanced query...")
-        if self.model_type in ["siglip", "clip"] and self.text_model:
-            # Use text model for query embedding to match web content embeddings
-            self.enhanced_query_embedding = self.text_model.encode(self.enhanced_query, convert_to_tensor=True)
-        else:
-            self.enhanced_query_embedding = embed_text(self.enhanced_query, self.model, self.processor, self.model_type, self.device)
+        self.enhanced_query_embedding = embed_text(self.enhanced_query, self.model, self.processor, self.model_type, self.device)
 
         # Create a knowledge base.
         print("[INFO] Creating KnowledgeBase...")
@@ -339,14 +375,7 @@ class SearchSession:
 
     def _get_default_model(self, provider, rag_model):
         """Get default model for the specified provider."""
-        if provider == "ollama":
-            return "gemma2:2b" if rag_model == "gemma" else "gemma2:2b"
-        elif provider == "openai":
-            return "gpt-3.5-turbo"
-        elif provider == "anthropic":
-            return "claude-3-sonnet-20240229"
-        else:
-            return "gemma2:2b"
+        return default_model_for_provider(provider, rag_model)
 
     async def run_session(self):
         """
@@ -381,9 +410,9 @@ class SearchSession:
         self.local_results = self.kb.search(self.enhanced_query, top_k=self.top_k)
 
         # 5) Summaries and final RAG generation
-        summarized_web = self._summarize_web_results(self.web_results)
-        summarized_local = self._summarize_local_results(self.local_results)
-        final_answer = self._build_final_answer(summarized_web, summarized_local)
+        summarized_web = await asyncio.to_thread(self._summarize_web_results, self.web_results)
+        summarized_local = await asyncio.to_thread(self._summarize_local_results, self.local_results)
+        final_answer = await asyncio.to_thread(self._build_final_answer, summarized_web, summarized_local)
         print("[INFO] Finished building final advanced report.")
         return final_answer
 
@@ -407,10 +436,7 @@ class SearchSession:
             sq_clean = clean_search_query(sq)
             if not sq_clean:
                 continue
-            if self.model_type in ["siglip", "clip"] and self.text_model:
-                node_emb = self.text_model.encode(sq_clean, convert_to_tensor=True)
-            else:
-                node_emb = embed_text(sq_clean, self.model, self.processor, self.model_type, self.device)
+            node_emb = embed_text(sq_clean, self.model, self.processor, self.model_type, self.device)
             score = late_interaction_score(self.enhanced_query_embedding, node_emb)
             scored_subqs.append((sq_clean, score))
             monte_carlo_metrics['candidate_scores'].append(score)
@@ -420,16 +446,18 @@ class SearchSession:
             return subqueries
 
         # Weighted random choice
-        weights = [s for (_, s) in scored_subqs]
+        scores = [s for (_, s) in scored_subqs]
+        weights = monte_carlo_sampling_weights(scores)
         monte_carlo_metrics['selection_weights'] = weights
-        chosen = random.choices(
-            population=scored_subqs,
-            weights=weights,
-            k=min(max_subqs, len(scored_subqs))
-        )
+        chosen = weighted_sample_without_replacement(scored_subqs, weights, min(max_subqs, len(scored_subqs)))
         # Return just the chosen subqueries
         chosen_sqs = [ch[0] for ch in chosen]
         monte_carlo_metrics['selected_queries'] = chosen_sqs
+        weights_by_query = {query: weight for (query, _), weight in zip(scored_subqs, weights)}
+        monte_carlo_metrics['selected_weights_by_query'] = {
+            query: weights_by_query.get(query, 0.0)
+            for query in chosen_sqs
+        }
         monte_carlo_metrics['avg_candidate_score'] = sum(monte_carlo_metrics['candidate_scores']) / len(monte_carlo_metrics['candidate_scores'])
         monte_carlo_metrics['avg_selected_score'] = sum(score for _, score in chosen) / len(chosen)
         
@@ -459,14 +487,11 @@ class SearchSession:
             # Create a TOC node with enhanced tracking
             toc_node = TOCNode(query_text=sq_clean, depth=current_depth)
             toc_node.node_id = str(uuid.uuid4())[:8]
-            toc_node.timestamps['created'] = datetime.now().isoformat()
+            toc_node.mark_timestamp('created')
             toc_node.parent_query = parent_query if parent_query else self.query
             
             # Relevance calculation with similarity tracking
-            if self.model_type in ["siglip", "clip"] and self.text_model:
-                node_embedding = self.text_model.encode(sq_clean, convert_to_tensor=True)
-            else:
-                node_embedding = embed_text(sq_clean, self.model, self.processor, self.model_type, self.device)
+            node_embedding = embed_text(sq_clean, self.model, self.processor, self.model_type, self.device)
             relevance = late_interaction_score(self.enhanced_query_embedding, node_embedding)
             toc_node.relevance_score = relevance
             toc_node.add_similarity_score(relevance)
@@ -474,12 +499,7 @@ class SearchSession:
             # Check if this node was selected by Monte Carlo
             if hasattr(self, 'monte_carlo_metrics') and sq_clean in self.monte_carlo_metrics.get('selected_queries', []):
                 toc_node.metrics['monte_carlo_selected'] = True
-                # Find the weight for this query
-                for i, (query, score) in enumerate(zip(self.monte_carlo_metrics.get('selected_queries', []), 
-                                                      self.monte_carlo_metrics.get('selection_weights', []))):
-                    if query == sq_clean:
-                        toc_node.metrics['monte_carlo_weight'] = score
-                        break
+                toc_node.metrics['monte_carlo_weight'] = self.monte_carlo_metrics.get('selected_weights_by_query', {}).get(sq_clean, 0.0)
 
             if relevance < min_relevance:
                 print(f"[INFO] Skipping branch '{sq_clean}' due to low relevance ({relevance:.2f} < {min_relevance}).")
@@ -487,12 +507,11 @@ class SearchSession:
 
             # Create subdirectory
             safe_subquery = sanitize_filename(sq_clean)[:30]
-            subquery_dir = os.path.join(self.base_result_dir, f"web_{safe_subquery}")
-            os.makedirs(subquery_dir, exist_ok=True)
+            subquery_dir = str(ensure_dir_under(self.base_result_dir, f"web_{safe_subquery}"))
             print(f"[DEBUG] Searching web for subquery '{sq_clean}' at depth={current_depth}...")
 
             # Track web search timing
-            toc_node.timestamps['web_search_start'] = datetime.now().isoformat()
+            toc_node.mark_timestamp('web_search_start')
             web_search_start = time.time()
             
             pages = await search_and_download(
@@ -504,7 +523,7 @@ class SearchSession:
             )
             
             web_search_end = time.time()
-            toc_node.timestamps['web_search_end'] = datetime.now().isoformat()
+            toc_node.mark_timestamp('web_search_end')
             toc_node.metrics['processing_time_ms'] += int((web_search_end - web_search_start) * 1000)
             branch_web_results = []
             branch_corpus_entries = []
@@ -527,18 +546,7 @@ class SearchSession:
                 limited_text = raw_text[:2048]
                 
                 try:
-                    # For web content (HTML/text), always use fast text embeddings
-                    # SigLIP/CLIP are only for vision tasks (images, PDFs)
-                    if self.model_type in ["siglip", "clip"] and self.text_model:
-                        # Use pre-loaded fast text model for web content
-                        emb = self.text_model.encode(limited_text, convert_to_tensor=True)
-                    elif self.model_type == "colpali":
-                        inputs = self.processor(text=[limited_text], truncation=True, max_length=512, return_tensors="pt").to(self.device)
-                        outputs = self.model(**inputs)
-                        emb = outputs.embeddings.mean(dim=1).squeeze(0)
-                    else:
-                        # all-MiniLM or other text models
-                        emb = self.model.encode(limited_text, convert_to_tensor=True)
+                    emb = embed_text(limited_text, self.model, self.processor, self.model_type, self.device)
                     
                     entry = {
                         "embedding": emb,
@@ -567,9 +575,9 @@ class SearchSession:
             # Summarize and update metrics
             branch_snippets = " ".join([r.get("snippet", "") for r in branch_web_results])
             summary_start = time.time()
-            toc_node.summary = self.llm_manager.summarize_text(branch_snippets)
+            toc_node.summary = await asyncio.to_thread(self.llm_manager.summarize_text, branch_snippets)
             summary_end = time.time()
-            toc_node.timestamps['summary_generated'] = datetime.now().isoformat()
+            toc_node.mark_timestamp('summary_generated')
             toc_node.metrics['processing_time_ms'] += int((summary_end - summary_start) * 1000)
             
             # Update content metrics
@@ -581,7 +589,7 @@ class SearchSession:
 
             additional_subqueries = []
             if current_depth < self.max_depth:
-                additional_query = self.llm_manager.enhance_query(sq_clean)
+                additional_query = await asyncio.to_thread(self.llm_manager.enhance_query, sq_clean)
                 if additional_query and additional_query != sq_clean:
                     additional_subqueries = split_query(additional_query, max_len=self.config.get("max_query_length", 200))
 
@@ -594,7 +602,7 @@ class SearchSession:
                     toc_node.add_child(child_node)
 
             # Mark node as completed
-            toc_node.timestamps['completed'] = datetime.now().isoformat()
+            toc_node.mark_timestamp('completed')
             
             aggregated_web_results.extend(branch_web_results)
             aggregated_corpus_entries.extend(branch_corpus_entries)
@@ -688,7 +696,7 @@ Report:
         
         # Save TOC as JSON for debugging and analysis
         if self.toc_tree:
-            toc_json_path = os.path.join(self.base_result_dir, "toc_analysis.json")
+            toc_json_path = safe_resolve_under(self.base_result_dir, "toc_analysis.json")
             try:
                 save_toc_to_json(self.toc_tree, toc_json_path, include_analytics=True)
                 print(f"[INFO] TOC analysis saved to: {toc_json_path}")

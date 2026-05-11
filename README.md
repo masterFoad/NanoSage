@@ -84,6 +84,9 @@ cp env.example .env
 # Edit .env and add your Tavily API key
 # Get your free API key at: https://tavily.com/
 TAVILY_API_KEY=your_tavily_api_key_here
+
+# Optional: copy reproducible runtime defaults
+cp config.example.yaml config.yaml
 ```
 
 ---
@@ -110,6 +113,7 @@ python main.py --query "research papers" --corpus_dir ./my_documents --retrieval
 - `--retrieval_model`: Choose from `siglip` (recommended), `clip`, `colpali`, or `all-minilm`.
 - `--device cpu`: Uses CPU (swap with `cuda` for GPU).
 - `--max_depth`: Recursion depth for subqueries (default: 1).
+- `--config`: YAML runtime defaults. CLI flags override matching config values.
 
 ---
 
@@ -150,6 +154,26 @@ Open the `*_output.md` file (e.g., `Quantum_computing_in_healthcare_output.md`) 
 
 ### 8. Advanced Options
 
+#### ⚙️ Runtime defaults and model upgrades
+
+NanoSage ships with `config.example.yaml` so runtime choices are visible instead
+of implicit. Copy it to `config.yaml` and edit locally:
+
+```bash
+cp config.example.yaml config.yaml
+```
+
+LLM provider defaults can also be overridden without source edits:
+
+```bash
+export NANOSAGE_OLLAMA_MODEL=gemma2:2b
+export NANOSAGE_OPENAI_MODEL=gpt-4o-mini
+export NANOSAGE_ANTHROPIC_MODEL=claude-haiku-4-5-20251001
+```
+
+Retrieval defaults now prefer `siglip`, with embedding compatibility checks to
+prevent mixed-dimension retrieval states.
+
 #### ✅ Using Local Files
 
 If you have local PDFs, text files, or images:
@@ -183,9 +207,17 @@ This uses **Gemma 2B** to generate LLM-based summaries and the final report.
 - **Too many subqueries?** Lower `--max_depth` to 1.
 - **Web search not working?** Check your `TAVILY_API_KEY` in `.env` file.
 
+### 10. Verification
+
+Run the audit-derived invariant tests:
+
+```bash
+python -m unittest discover -s tests
+```
+
 ---
 
-### 10. Next Steps
+### 11. Next Steps
 
 - **Try different retrieval models** (`--retrieval_model siglip` for best results).
 - **Tweak recursion** (`--max_depth`).
@@ -197,16 +229,15 @@ This uses **Gemma 2B** to generate LLM-based summaries and the final report.
 
 NanoSage uses a **hybrid embedding approach** for optimal performance:
 
-- **Vision Models (SigLIP/CLIP)**: 
-  - Use **SigLIP/CLIP** for images and PDFs → images
-  - Use **all-MiniLM** for text content (web pages, documents)
-  - Ensures consistent 384D embeddings for text content
+- **Vision Models (SigLIP/CLIP)**:
+  - Use the active SigLIP/CLIP text and image encoders in one aligned vector space
+  - Avoid mixing MiniLM query embeddings with SigLIP/CLIP document embeddings
 
 - **Text Models (ColPali/all-MiniLM)**:
   - Use the same model for all content types
   - Consistent embedding dimensions
 
-This approach eliminates dimension mismatches and uses the right tool for each content type.
+This approach makes dimension mismatches explicit and uses the right tool for each content type.
 
 ## Web Search Integration
 

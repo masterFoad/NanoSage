@@ -1,6 +1,6 @@
 # aggregator.py
 
-import os
+from path_utils import ensure_dir_under, safe_resolve_under
 
 def aggregate_results(query_id, enhanced_query, web_results, local_results, final_answer, config,
                      grouped_web_results=None, previous_results=None, follow_up_conversation=None):
@@ -10,17 +10,16 @@ def aggregate_results(query_id, enhanced_query, web_results, local_results, fina
       2) final_report.md - Contains only the final RAG answer.
     """
     base_dir = config.get("results_base_dir", "results")
-    output_dir = os.path.join(base_dir, query_id)
-    os.makedirs(output_dir, exist_ok=True)
+    output_dir = ensure_dir_under(base_dir, query_id)
 
     # 1) Save only the final answer to final_report.md
-    final_report_path = os.path.join(output_dir, "final_report.md")
+    final_report_path = safe_resolve_under(output_dir, "final_report.md")
     with open(final_report_path, "w", encoding="utf-8") as fr:
         fr.write("# Final Aggregated Answer (RAG)\n\n")
         fr.write(final_answer.strip() + "\n")
 
     # 2) Create the main aggregator file with final RAG answer at the top
-    aggregator_path = os.path.join(output_dir, f"{query_id}_output.md")
+    aggregator_path = safe_resolve_under(output_dir, f"{query_id}_output.md")
     with open(aggregator_path, "w", encoding="utf-8") as f:
         f.write(f"# Aggregated Results for Query ID: {query_id}\n\n")
 
@@ -65,4 +64,4 @@ def aggregate_results(query_id, enhanced_query, web_results, local_results, fina
             f.write("## Follow-Up Conversation\n")
             f.write(follow_up_conversation.strip() + "\n")
 
-    return aggregator_path
+    return str(aggregator_path)

@@ -69,6 +69,36 @@ def _l2norm(x: torch.Tensor) -> torch.Tensor:
     return x / (x.norm(dim=-1, keepdim=True) + 1e-12)
 
 
+def _as_flat_float_tensor(value, *, label: str) -> torch.Tensor:
+    """Normalize embedding-like values into a non-empty flat float tensor."""
+    if value is None:
+        raise ValueError(f"{label} embedding is missing")
+    if not isinstance(value, torch.Tensor):
+        value = torch.as_tensor(value)
+    flat = value.detach().float().cpu().view(-1)
+    if flat.numel() == 0:
+        raise ValueError(f"{label} embedding is empty")
+    return flat
+
+
+def validate_embedding_compatibility(query_emb, doc_emb) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Ensure query and document embeddings can be scored in the same vector space.
+
+    The audit found that hybrid retrieval paths can silently mix dimensions. Make
+    that state impossible to score: callers either get compatible tensors or a
+    concrete error explaining the incompatible shapes.
+    """
+    q_vec = _as_flat_float_tensor(query_emb, label="query")
+    d_vec = _as_flat_float_tensor(doc_emb, label="document")
+    if q_vec.numel() != d_vec.numel():
+        raise ValueError(
+            "Embedding dimension mismatch: "
+            f"query has {q_vec.numel()} values, document has {d_vec.numel()} values"
+        )
+    return q_vec, d_vec
+
+
 def embed_text(query, model, processor, model_type="colpali", device="cpu"):
     """
     Backward-compatible. Always returns a torch.Tensor on CPU for uniformity.
@@ -117,22 +147,28 @@ def embed_text(query, model, processor, model_type="colpali", device="cpu"):
 ##################
 
 def late_interaction_score(query_emb, doc_emb):
-    q_vec = query_emb.view(-1)
-    d_vec = doc_emb.view(-1)
+    q_vec, d_vec = validate_embedding_compatibility(query_emb, doc_emb)
     q_norm = q_vec / (q_vec.norm() + 1e-12)
     d_norm = d_vec / (d_vec.norm() + 1e-12)
     return float(torch.dot(q_norm, d_norm))
 
 
 def retrieve(query, corpus, model, processor, top_k=3, model_type="colpali", device="cpu", text_model=None):
-    # Use text_model for query embedding when available (for hybrid vision+text models)
-    if model_type in ["siglip", "clip"] and text_model:
-        query_embedding = text_model.encode(query, convert_to_tensor=True)
-    else:
-        query_embedding = embed_text(query, model, processor, model_type=model_type, device=device)
+    if top_k <= 0 or not corpus:
+        return []
+
+    # Keep query and document embeddings in the active retriever's vector space.
+    # The optional text_model argument remains for API compatibility but is no
+    # longer used to avoid mixed SigLIP/CLIP vs MiniLM dimensions.
+    query_embedding = embed_text(query, model, processor, model_type=model_type, device=device)
     scores = []
-    for entry in corpus:
-        score = late_interaction_score(query_embedding, entry['embedding'])
+    for idx, entry in enumerate(corpus):
+        try:
+            score = late_interaction_score(query_embedding, entry['embedding'])
+        except ValueError as exc:
+            metadata = entry.get("metadata", {})
+            source = metadata.get("file_path") or metadata.get("url") or f"corpus[{idx}]"
+            raise ValueError(f"Incompatible embedding for {source}: {exc}") from exc
         scores.append(score)
     top_indices = np.argsort(scores)[-top_k:][::-1]
     return [corpus[i] for i in top_indices]
@@ -324,14 +360,14 @@ def load_corpus_from_dir(corpus_dir, model, processor, device="cpu", model_type=
 
 class KnowledgeBase:
     """
-    Same public API, faster VLM support under the hood.
+    Same public API with explicit embedding-compatibility checks.
     """
     def __init__(self, model, processor, model_type="colpali", device="cpu", text_model=None):
         self.model = model
         self.processor = processor
         self.model_type = model_type
         self.device = device
-        self.text_model = text_model  # For hybrid vision+text models
+        self.text_model = text_model  # Kept for backward-compatible constructor calls.
         self.corpus = []
 
     def add_documents(self, entries):

@@ -1,0 +1,22 @@
+# NanoSage runtime defaults. Copy to config.yaml and edit locally.
+# Secrets belong in .env or environment variables, not in this file.
+
+results_base_dir: results
+retrieval_model: siglip   # siglip | clip | colpali | all-minilm
+device: cpu
+top_k: 3
+web_search: false
+web_search_limit: 5
+web_concurrency: 8
+include_wikipedia: false
+max_depth: 1
+max_query_length: 200
+min_relevance: 0.5
+monte_carlo_search: true
+monte_carlo_samples: 3
+rag_model: gemma
+
+llm:
+  provider: ollama        # ollama | openai | anthropic
+  # model: gemma2:2b      # Optional. Env overrides also work:
+  # NANOSAGE_OLLAMA_MODEL, NANOSAGE_OPENAI_MODEL, NANOSAGE_ANTHROPIC_MODEL

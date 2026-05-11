@@ -50,6 +50,7 @@ Thumbs.db
 # Project specific
 results/
 downloaded_webpages/
+.audit-runs/
 *.log
 *.tmp
 *.temp
@@ -68,11 +69,6 @@ downloaded_webpages/
 *.pickle
 *.h5
 *.hdf5
-
-# Test files
-test_*.py
-*_test.py
-tests/
 
 # Jupyter
 .ipynb_checkpoints/

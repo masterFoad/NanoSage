@@ -4,7 +4,30 @@ import os
 import time
 from abc import ABC, abstractmethod
 from typing import Optional, Dict, Any
-import json
+
+DEFAULT_PROVIDER_MODELS = {
+    "ollama": "gemma2:2b",
+    "openai": "gpt-4o-mini",
+    "anthropic": "claude-haiku-4-5-20251001",
+}
+
+
+def default_model_for_provider(provider: str, rag_model: str = "gemma") -> str:
+    """
+    Resolve provider defaults with environment overrides.
+
+    Environment variables intentionally make model upgrades operational instead
+    of source-code edits:
+      - NANOSAGE_OLLAMA_MODEL
+      - NANOSAGE_OPENAI_MODEL
+      - NANOSAGE_ANTHROPIC_MODEL
+    """
+    provider_key = (provider or "ollama").lower()
+    env_name = f"NANOSAGE_{provider_key.upper()}_MODEL"
+    if os.getenv(env_name):
+        return os.environ[env_name]
+    return DEFAULT_PROVIDER_MODELS.get(provider_key, DEFAULT_PROVIDER_MODELS["ollama"])
+
 
 class LLMProvider(ABC):
     """Abstract base class for LLM providers."""
@@ -58,7 +81,7 @@ class OllamaProvider(LLMProvider):
 class OpenAIProvider(LLMProvider):
     """OpenAI provider implementation."""
     
-    def __init__(self, model: str = "gpt-3.5-turbo", api_key: Optional[str] = None, **kwargs):
+    def __init__(self, model: str = DEFAULT_PROVIDER_MODELS["openai"], api_key: Optional[str] = None, **kwargs):
         self.model = model
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         self.kwargs = kwargs
@@ -98,7 +121,7 @@ class OpenAIProvider(LLMProvider):
 class AnthropicProvider(LLMProvider):
     """Anthropic Claude provider implementation."""
     
-    def __init__(self, model: str = "claude-3-sonnet-20240229", api_key: Optional[str] = None, **kwargs):
+    def __init__(self, model: str = DEFAULT_PROVIDER_MODELS["anthropic"], api_key: Optional[str] = None, **kwargs):
         self.model = model
         self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
         self.kwargs = kwargs
@@ -152,14 +175,19 @@ class LLMManager:
     def _create_provider(self) -> LLMProvider:
         """Create provider instance based on configuration."""
         provider_type = self.provider_config.get("provider", "ollama").lower()
-        model = self.provider_config.get("model", "gemma2:2b")
+        model = self.provider_config.get("model") or default_model_for_provider(provider_type)
+        provider_kwargs = {
+            key: value
+            for key, value in self.provider_config.items()
+            if key not in {"provider", "model", "personality"} and value is not None
+        }
         
         if provider_type == "ollama":
-            return OllamaProvider(model=model)
+            return OllamaProvider(model=model, **provider_kwargs)
         elif provider_type == "openai":
-            return OpenAIProvider(model=model)
+            return OpenAIProvider(model=model, **provider_kwargs)
         elif provider_type == "anthropic":
-            return AnthropicProvider(model=model)
+            return AnthropicProvider(model=model, **provider_kwargs)
         else:
             raise ValueError(f"Unsupported provider: {provider_type}")
     
@@ -235,12 +263,12 @@ class LLMManager:
         return self.generate(follow_up_prompt)
 
 # Factory function for easy provider creation
-def create_llm_manager(provider: str = "ollama", model: str = "gemma2:2b", 
+def create_llm_manager(provider: str = "ollama", model: Optional[str] = None,
                       personality: Optional[str] = None, **kwargs) -> LLMManager:
     """Create an LLM manager with the specified configuration."""
     config = {
         "provider": provider,
-        "model": model,
+        "model": model or default_model_for_provider(provider),
         "personality": personality,
         **kwargs
     }

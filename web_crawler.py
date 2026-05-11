@@ -91,7 +91,7 @@ try:
     TAVILY_AVAILABLE = True
 except Exception as e:
     TAVILY_AVAILABLE = False
-    print(f"Tavily not available: {e}")
+    logging.debug("Tavily not available: %s", e)
 
 __VERSION__ = "0.2.0"
 
@@ -698,9 +698,15 @@ async def search_and_download(keyword: str, out_dir: str = "downloaded_webpages"
 
     pages = await download_many(urls, out_dir, concurrency=concurrency)
 
-    # parse + sidecar metadata
+    # parse + sidecar metadata. Match by URL instead of zipping ranked/pages:
+    # downloads can be skipped, and zip would misattribute source metadata.
+    ranked_by_url = {r.href: r for r in ranked if r.href}
     parsed = []
-    for r, page in zip(ranked, pages):
+    for page in pages:
+        r = ranked_by_url.get(page["url"])
+        if r is None:
+            logging.warning("Downloaded page has no ranked metadata match: %s", page["url"])
+            continue
         text = parse_any_to_text(page["file_path"]) or ""
         preview = (text[:800] + "…") if text else ""
         sidecar = {
