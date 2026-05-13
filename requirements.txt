@@ -24,7 +24,7 @@ ocrmypdf
 ollama
 
 # Optional LLM Providers (install as needed)
-# openai          # For OpenAI API integration
+openai          # For OpenAI API and OpenAI-compatible LiteLLM gateways
 # anthropic       # For Anthropic Claude integration
 
 # Tavily Search API

@@ -46,7 +46,7 @@ def main():
     parser.add_argument("--personality", type=str, default=None, help="Optional personality for LLM (e.g. cheerful)")
     parser.add_argument("--rag_model", type=str, default=None, help="Which model family to use for final RAG steps")
     parser.add_argument("--max_depth", type=int, default=None, help="Depth limit for subquery expansions")
-    parser.add_argument("--llm_provider", type=str, choices=["ollama", "openai", "anthropic"], default=None, help="LLM provider to use")
+    parser.add_argument("--llm_provider", type=str, choices=["ollama", "openai", "anthropic", "litellm"], default=None, help="LLM provider to use")
     parser.add_argument("--llm_model", type=str, default=None, help="Specific LLM model to use (overrides provider default)")
     parser.add_argument("--web_concurrency", type=int, default=None, help="Concurrent web downloads")
     parser.add_argument("--include_wikipedia", action="store_true", default=None, help="Include Wikipedia in web search")

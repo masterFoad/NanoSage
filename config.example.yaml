@@ -19,6 +19,14 @@ monte_carlo_samples: 3
 rag_model: gemma
 
 llm:
-  provider: ollama        # ollama | openai | anthropic
+  provider: ollama        # ollama | openai | anthropic | litellm
   # model: gemma2:2b      # Optional. Env overrides also work:
-  # NANOSAGE_OLLAMA_MODEL, NANOSAGE_OPENAI_MODEL, NANOSAGE_ANTHROPIC_MODEL
+  # NANOSAGE_OLLAMA_MODEL, NANOSAGE_OPENAI_MODEL, NANOSAGE_ANTHROPIC_MODEL, NANOSAGE_LITELLM_MODEL
+
+agentic_tools:
+  enabled: false
+  mode: iterative    # iterative | one-shot
+  workspace: .
+  max_rounds: 3
+  max_calls: 8
+  min_score: 0.05

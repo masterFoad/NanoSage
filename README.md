@@ -169,6 +169,36 @@ LLM provider defaults can also be overridden without source edits:
 export NANOSAGE_OLLAMA_MODEL=gemma2:2b
 export NANOSAGE_OPENAI_MODEL=gpt-4o-mini
 export NANOSAGE_ANTHROPIC_MODEL=claude-haiku-4-5-20251001
+export NANOSAGE_LITELLM_MODEL=gpt-4o-mini
+```
+
+For LiteLLM/OpenAI-compatible gateway runs:
+
+```bash
+export LITELLM_API_KEY=...
+python scripts/litellm_smoke.py \
+  --base-url http://localhost:4000/v1 \
+  --model gpt-4o-mini
+
+python main.py \
+  --config config.litellm.example.yaml \
+  --query "Summarize NanoSage's architecture from local files only"
+```
+
+Render the latest run as a standalone local dashboard:
+
+```bash
+python scripts/visualize_run.py --workspace . --run latest
+# prints: /path/to/workspace/results/<run_id>/dashboard.html
+```
+
+Render a specific workspace/run:
+
+```bash
+python scripts/visualize_run.py \
+  --workspace /path/to/NanoSage \
+  --run <run_id> \
+  --output /tmp/nanosage-dashboard.html
 ```
 
 Retrieval defaults now prefer `siglip`, with embedding compatibility checks to
@@ -180,6 +210,27 @@ queue. Tune with:
 
 - `branch_mmr_lambda`: higher favors relevance; lower favors diversity.
 - `max_branches`: caps total web branches explored in one session.
+
+NanoSage can also run a small scored local tool policy before synthesis. Enable
+`agentic_tools` in config to run bounded read-only tools:
+
+- `read_file_lines`: reads selected line ranges from workspace files.
+- `grep`: searches text files with bounded regex matches.
+- `git_explore`: inspects read-only git status/log/tracked files.
+
+Each tool call emits a score plus a `tool_results.json` artifact, and the tool
+observations are included in the final synthesis prompt. The policy is
+abstracted in `agent_tools.py` so projects can override the planner or add
+custom scored tools.
+
+By default, the policy is iterative: it runs an initial round, observes scored
+results, then follows grep hits or tracked-file leads with additional
+`read_file_lines` calls until `max_rounds`, `max_calls`, or no new useful
+requests remain. The full loop is saved as `agent_trace.json`.
+
+The visual dashboard reads `tool_results.json`, `evidence_ledger.json`,
+`agent_trace.json`, `toc_analysis.json`, and the Markdown report when present.
+It works for local tool-only runs and web/evidence runs.
 
 #### ✅ Using Local Files
 

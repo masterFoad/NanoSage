@@ -13,6 +13,7 @@ from knowledge_base import KnowledgeBase, late_interaction_score, load_corpus_fr
 from web_crawler import search_and_download, parse_any_to_text, sanitize_filename
 import json
 from aggregator import aggregate_results
+from agent_tools import HeuristicAgenticPolicy, LegacyOneShotPolicy, run_policy_tools
 from evidence import SearchBranch, make_evidence_item, mmr_rerank, novelty_against
 from path_utils import ensure_dir_under, safe_resolve_under
 
@@ -325,10 +326,12 @@ class SearchSession:
         self.max_depth = max_depth
         
         # Initialize LLM manager
+        configured_llm = config.get("llm", {}) if isinstance(config.get("llm", {}), dict) else {}
         llm_config = {
+            **configured_llm,
             "provider": llm_provider,
             "model": llm_model or self._get_default_model(llm_provider, rag_model),
-            "personality": personality
+            "personality": personality or configured_llm.get("personality")
         }
         self.llm_manager = create_llm_manager(**llm_config)
 
@@ -343,19 +346,29 @@ class SearchSession:
         if not self.enhanced_query:
             self.enhanced_query = self.query
 
-        # Load retrieval model.
-        self.model, self.processor, self.model_type = load_retrieval_model(
-            model_choice=self.retrieval_model,
-            device=self.device
-        )
-        
-        # Keep a single retrieval vector space per session. Earlier hybrid
-        # MiniLM-for-text + SigLIP/CLIP-for-vision paths could mix dimensions.
+        # Load retrieval only when the run can actually use it. This keeps
+        # LiteLLM/local-tool smoke runs from requiring embedding dependencies.
+        self.retrieval_active = bool(self.corpus_dir or self.web_search_enabled)
+        self.model = None
+        self.processor = None
+        self.model_type = self.retrieval_model
         self.text_model = None
+        self.enhanced_query_embedding = None
+        if self.retrieval_active:
+            self.model, self.processor, self.model_type = load_retrieval_model(
+                model_choice=self.retrieval_model,
+                device=self.device
+            )
 
-        # Compute the overall enhanced query embedding once.
-        print("[INFO] Computing embedding for enhanced query...")
-        self.enhanced_query_embedding = embed_text(self.enhanced_query, self.model, self.processor, self.model_type, self.device)
+            # Keep a single retrieval vector space per session. Earlier hybrid
+            # MiniLM-for-text + SigLIP/CLIP-for-vision paths could mix dimensions.
+            self.text_model = None
+
+            # Compute the overall enhanced query embedding once.
+            print("[INFO] Computing embedding for enhanced query...")
+            self.enhanced_query_embedding = embed_text(self.enhanced_query, self.model, self.processor, self.model_type, self.device)
+        else:
+            print("[INFO] Retrieval inactive: no corpus_dir and web search disabled.")
 
         # Create a knowledge base.
         print("[INFO] Creating KnowledgeBase...")
@@ -372,6 +385,8 @@ class SearchSession:
         # Placeholders for web search results and TOC tree.
         self.web_results = []
         self.evidence_items = []
+        self.tool_results = []
+        self.agent_trace = {}
         self.grouped_web_results = {}
         self.local_results = []
         self.toc_tree = []  # List of TOCNode objects for the initial subqueries
@@ -388,14 +403,19 @@ class SearchSession:
         print(f"[INFO] Starting session with query_id={self.query_id}, max_depth={self.max_depth}")
         plain_enhanced_query = clean_search_query(self.enhanced_query)
 
+        if self.config.get("agentic_tools", {}).get("enabled", False):
+            self.tool_results = await asyncio.to_thread(self._run_agentic_tools, plain_enhanced_query)
+
         # 1) Generate subqueries from the enhanced query
         initial_subqueries = split_query(plain_enhanced_query, max_len=self.config.get("max_query_length", 200))
         print(f"[INFO] Generated {len(initial_subqueries)} initial subqueries from the enhanced query.")
 
         # 2) Optionally do a Monte Carlo approach to sample subqueries
-        if self.config.get("monte_carlo_search", True):
+        if self.retrieval_active and self.config.get("monte_carlo_search", True):
             print("[INFO] Using Monte Carlo approach to sample subqueries.")
             initial_subqueries = self.perform_monte_carlo_subqueries(plain_enhanced_query, initial_subqueries)
+        elif not self.retrieval_active:
+            print("[INFO] Retrieval inactive; skipping Monte Carlo relevance sampling.")
 
         # 3) If web search is enabled and max_depth >= 1, do the recursive expansion
         if self.web_search_enabled and self.max_depth >= 1:
@@ -411,14 +431,37 @@ class SearchSession:
 
         # 4) Local retrieval
         print(f"[INFO] Retrieving top {self.top_k} local documents for final answer.")
-        self.local_results = self.kb.search(self.enhanced_query, top_k=self.top_k)
+        self.local_results = self.kb.search(self.enhanced_query, top_k=self.top_k) if self.kb.corpus else []
 
         # 5) Summaries and final RAG generation
         summarized_web = await asyncio.to_thread(self._summarize_web_results, self.web_results)
         summarized_local = await asyncio.to_thread(self._summarize_local_results, self.local_results)
-        final_answer = await asyncio.to_thread(self._build_final_answer, summarized_web, summarized_local)
+        summarized_tools = self._summarize_tool_results(self.tool_results)
+        final_answer = await asyncio.to_thread(self._build_final_answer, summarized_web, summarized_local, summarized_tools)
         print("[INFO] Finished building final advanced report.")
         return final_answer
+
+    def _run_agentic_tools(self, query):
+        tool_config = self.config.get("agentic_tools", {})
+        max_calls = int(tool_config.get("max_calls", 5))
+        max_rounds = int(tool_config.get("max_rounds", 3))
+        min_score = float(tool_config.get("min_score", 0.05))
+        workspace = safe_resolve_under(tool_config.get("workspace", ".")) if tool_config.get("workspace") else safe_resolve_under(".")
+        mode = str(tool_config.get("mode", "iterative")).lower()
+        policy = LegacyOneShotPolicy() if mode == "one-shot" else HeuristicAgenticPolicy()
+        results, trace = run_policy_tools(
+            query,
+            workspace,
+            policy,
+            max_rounds=max_rounds,
+            max_calls=max_calls,
+            min_score=min_score,
+        )
+        self.agent_trace = trace
+        print(f"[INFO] Agentic tool policy ran {len(results)} tool calls across {len(trace.get('rounds', []))} rounds; stop={trace.get('stop_reason')}.")
+        for result in results:
+            print(f"[DEBUG] tool={result.name} score={result.score:.3f} ok={result.ok} summary={result.summary}")
+        return results
 
     def perform_monte_carlo_subqueries(self, parent_query, subqueries):
         """
@@ -705,7 +748,18 @@ class SearchSession:
         text = "\n".join(lines)
         return self.llm_manager.summarize_text(text)
 
-    def _build_final_answer(self, summarized_web, summarized_local, previous_results_content="", follow_up_convo=""):
+    def _summarize_tool_results(self, tool_results):
+        if not tool_results:
+            return "No local tool observations."
+        lines = []
+        for result in tool_results:
+            lines.append(
+                f"Tool: {result.name} | score={result.score:.3f} | ok={result.ok} | "
+                f"summary={result.summary}\n{result.content[:1200]}"
+            )
+        return "\n\n".join(lines)
+
+    def _build_final_answer(self, summarized_web, summarized_local, summarized_tools="", previous_results_content="", follow_up_convo=""):
         toc_str = build_toc_string(self.toc_tree) if self.toc_tree else "No TOC available."
         # Build a reference links string from _reference_links, if available
         reference_links = ""
@@ -731,6 +785,9 @@ Summarized Web Results:
 
 Summarized Local Document Results:
 {summarized_local}
+
+Local Agentic Tool Observations:
+{summarized_tools}
 
 Reference Links (unique URLs found):
 {reference_links}
@@ -765,6 +822,24 @@ Report:
                 print(f"[INFO] Evidence ledger saved to: {evidence_path}")
             except Exception as e:
                 print(f"[WARN] Failed to save evidence ledger: {e}")
+
+        if self.tool_results:
+            tool_path = safe_resolve_under(self.base_result_dir, "tool_results.json")
+            try:
+                with open(tool_path, "w", encoding="utf-8") as f:
+                    json.dump([result.to_dict() for result in self.tool_results], f, indent=2, ensure_ascii=False)
+                print(f"[INFO] Tool results saved to: {tool_path}")
+            except Exception as e:
+                print(f"[WARN] Failed to save tool results: {e}")
+
+        if self.agent_trace:
+            trace_path = safe_resolve_under(self.base_result_dir, "agent_trace.json")
+            try:
+                with open(trace_path, "w", encoding="utf-8") as f:
+                    json.dump(self.agent_trace, f, indent=2, ensure_ascii=False)
+                print(f"[INFO] Agent trace saved to: {trace_path}")
+            except Exception as e:
+                print(f"[WARN] Failed to save agent trace: {e}")
         
         return aggregate_results(
             self.query_id,

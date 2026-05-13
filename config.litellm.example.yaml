@@ -1,0 +1,35 @@
+# Generic LiteLLM/OpenAI-compatible NanoSage config.
+# Copy to config.yaml or pass with --config config.litellm.example.yaml.
+# Required secret: export LITELLM_API_KEY=...
+
+results_base_dir: results
+retrieval_model: all-minilm   # Lightweight smoke default; switch to siglip for multimodal runs.
+device: cpu
+top_k: 3
+web_search: false
+web_search_limit: 3
+web_concurrency: 4
+include_wikipedia: false
+max_depth: 0
+max_query_length: 200
+min_relevance: 0.3
+max_branches: 20
+branch_mmr_lambda: 0.72
+monte_carlo_search: true
+monte_carlo_samples: 3
+rag_model: litellm
+
+llm:
+  provider: litellm
+  model: gpt-4o-mini
+  base_url: http://localhost:4000/v1
+  timeout: 60
+  max_retries: 1
+
+agentic_tools:
+  enabled: true
+  mode: iterative
+  workspace: .
+  max_rounds: 3
+  max_calls: 8
+  min_score: 0.05

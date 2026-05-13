@@ -9,6 +9,7 @@ DEFAULT_PROVIDER_MODELS = {
     "ollama": "gemma2:2b",
     "openai": "gpt-4o-mini",
     "anthropic": "claude-haiku-4-5-20251001",
+    "litellm": "gpt-4o-mini",
 }
 
 
@@ -21,11 +22,14 @@ def default_model_for_provider(provider: str, rag_model: str = "gemma") -> str:
       - NANOSAGE_OLLAMA_MODEL
       - NANOSAGE_OPENAI_MODEL
       - NANOSAGE_ANTHROPIC_MODEL
+      - NANOSAGE_LITELLM_MODEL
     """
     provider_key = (provider or "ollama").lower()
     env_name = f"NANOSAGE_{provider_key.upper()}_MODEL"
     if os.getenv(env_name):
         return os.environ[env_name]
+    if provider_key == "litellm" and os.getenv("LITELLM_MODEL"):
+        return os.environ["LITELLM_MODEL"]
     return DEFAULT_PROVIDER_MODELS.get(provider_key, DEFAULT_PROVIDER_MODELS["ollama"])
 
 
@@ -81,17 +85,29 @@ class OllamaProvider(LLMProvider):
 class OpenAIProvider(LLMProvider):
     """OpenAI provider implementation."""
     
-    def __init__(self, model: str = DEFAULT_PROVIDER_MODELS["openai"], api_key: Optional[str] = None, **kwargs):
+    def __init__(self, model: str = DEFAULT_PROVIDER_MODELS["openai"], api_key: Optional[str] = None,
+                 base_url: Optional[str] = None, **kwargs):
         self.model = model
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
-        self.kwargs = kwargs
+        self.kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if key not in {"timeout", "max_retries"}
+        }
         
         if not self.api_key:
             raise ValueError("OpenAI API key not provided. Set OPENAI_API_KEY environment variable or pass api_key parameter.")
         
         try:
             import openai
-            self.client = openai.OpenAI(api_key=self.api_key)
+            client_kwargs = {"api_key": self.api_key}
+            if base_url:
+                client_kwargs["base_url"] = base_url
+            if kwargs.get("timeout") is not None:
+                client_kwargs["timeout"] = kwargs["timeout"]
+            if kwargs.get("max_retries") is not None:
+                client_kwargs["max_retries"] = kwargs["max_retries"]
+            self.client = openai.OpenAI(**client_kwargs)
         except ImportError:
             raise ImportError("OpenAI not available. Install with: pip install openai")
     
@@ -117,6 +133,24 @@ class OpenAIProvider(LLMProvider):
     
     def get_provider_name(self) -> str:
         return f"openai:{self.model}"
+
+
+class LiteLLMProvider(OpenAIProvider):
+    """OpenAI-compatible LiteLLM gateway provider."""
+
+    def __init__(self, model: str = DEFAULT_PROVIDER_MODELS["litellm"], api_key: Optional[str] = None,
+                 base_url: Optional[str] = None, **kwargs):
+        api_key = api_key or os.getenv("LITELLM_API_KEY")
+        base_url = base_url or os.getenv("LITELLM_BASE_URL") or os.getenv("LITELLM_API_BASE") or os.getenv("OPENAI_BASE_URL")
+        if not base_url:
+            raise ValueError(
+                "LiteLLM base URL not provided. Set LITELLM_BASE_URL or pass base_url in config."
+            )
+        super().__init__(model=model, api_key=api_key, base_url=base_url, **kwargs)
+        self.base_url = base_url
+
+    def get_provider_name(self) -> str:
+        return f"litellm:{self.model}"
 
 class AnthropicProvider(LLMProvider):
     """Anthropic Claude provider implementation."""
@@ -186,6 +220,8 @@ class LLMManager:
             return OllamaProvider(model=model, **provider_kwargs)
         elif provider_type == "openai":
             return OpenAIProvider(model=model, **provider_kwargs)
+        elif provider_type == "litellm":
+            return LiteLLMProvider(model=model, **provider_kwargs)
         elif provider_type == "anthropic":
             return AnthropicProvider(model=model, **provider_kwargs)
         else:
