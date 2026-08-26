@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass, field
-from typing import Iterable, Sequence
+from dataclasses import asdict, dataclass, field
+from typing import Iterable, Mapping, Sequence
+
+from chunking import locate_quote
 
 
 def stable_id(*parts: object, prefix: str = "ev") -> str:
@@ -25,16 +27,21 @@ class EvidenceItem:
     source_engine: str = "unknown"
     content_type: str = ""
     branch_query: str = ""
+    extracted_text_path: str = ""
+    extracted_text_length: int = 0
     confidence: float = 1.0
 
 
 @dataclass(frozen=True)
 class Claim:
-    """Atomic claim shell for future claim-ledger/report synthesis work."""
+    """Atomic, span-grounded claim proposed by the LLM."""
 
     claim_id: str
-    text: str
-    evidence_ids: tuple[str, ...] = ()
+    claim_text: str
+    evidence_id: str
+    quote: str
+    char_start: int
+    char_end: int
     confidence: float = 0.0
 
 
@@ -47,6 +54,10 @@ class SearchBranch:
     relevance: float
     parent_query: str | None = None
     novelty: float = 1.0
+    # What to type into a search engine for this branch. `query` is the full
+    # research question -- precise for scoring and summarization, but a poor
+    # keyword query -- so the two are kept separate.
+    search_terms: str = ""
     priority: float = field(init=False)
 
     def __post_init__(self) -> None:
@@ -80,6 +91,25 @@ def branch_priority(relevance: float, novelty: float, depth: int, *, relevance_w
     novelty_weight = 1.0 - relevance_weight
     depth_penalty = max(depth - 1, 0) * 0.04
     return (relevance_weight * relevance) + (novelty_weight * novelty) - depth_penalty
+
+
+def refresh_search_branch(
+    branch: SearchBranch,
+    explored_queries: Iterable[str],
+    *,
+    repush_delta: float = 1e-6,
+) -> tuple[SearchBranch, bool]:
+    """Recompute novelty and signal when stale priority materially decreased."""
+    novelty = novelty_against(branch.query, explored_queries)
+    refreshed = SearchBranch(
+        query=branch.query,
+        depth=branch.depth,
+        relevance=branch.relevance,
+        parent_query=branch.parent_query,
+        novelty=novelty,
+        search_terms=branch.search_terms,
+    )
+    return refreshed, (branch.priority - refreshed.priority) > repush_delta
 
 
 def mmr_rerank(candidates: Sequence[tuple[str, float]], *, lambda_relevance: float = 0.72) -> list[tuple[str, float]]:
@@ -123,5 +153,93 @@ def make_evidence_item(page: dict, meta: dict, branch_query: str, snippet: str) 
         source_engine=meta.get("source_engine", "unknown"),
         content_type=meta.get("content_type", ""),
         branch_query=branch_query,
+        extracted_text_path=meta.get("extracted_text_path", ""),
+        extracted_text_length=int(meta.get("extracted_text_length", 0) or 0),
         confidence=1.0 if url and file_path else 0.0,
     )
+
+
+def verify_claims(
+    claims: Sequence[Claim | Mapping[str, object]],
+    canonical_text_by_evidence_id: dict[str, str],
+) -> tuple[list[dict], list[dict]]:
+    """Verify proposed claims against canonical extracted text spans.
+
+    Returns `(kept, rejected)` serializable ledger entries. Malformed records are
+    rejected instead of raising so bad model output can be persisted.
+    """
+    kept: list[dict] = []
+    rejected: list[dict] = []
+    for raw_claim in claims:
+        claim, reason = _coerce_claim_record(raw_claim)
+        if reason:
+            rejected.append({"claim": _serializable_claim(raw_claim), "kept": False, "rejection_reason": reason})
+            continue
+        text = canonical_text_by_evidence_id.get(str(claim["evidence_id"]))
+        if text is None:
+            rejected.append({"claim": claim, "kept": False, "rejection_reason": "unknown_evidence_id"})
+            continue
+        # Offsets are DERIVED, never trusted. Models copy text accurately but cannot
+        # count characters, so any model-supplied span is treated as advisory only.
+        located = locate_quote(text, str(claim["quote"]))
+        if located is None:
+            rejected.append({"claim": claim, "kept": False, "rejection_reason": "quote_not_found"})
+            continue
+        start, end = located
+        claim["char_start"] = start
+        claim["char_end"] = end
+        kept.append({"claim": claim, "kept": True})
+    return kept, rejected
+
+
+def _coerce_claim_record(raw_claim: Claim | Mapping[str, object]) -> tuple[dict, str]:
+    if isinstance(raw_claim, Claim):
+        value = asdict(raw_claim)
+    elif isinstance(raw_claim, Mapping):
+        value = dict(raw_claim)
+    else:
+        return _serializable_claim(raw_claim), "malformed_claim"
+    required = ("claim_text", "evidence_id", "quote")
+    missing = [key for key in required if key not in value]
+    if missing:
+        return value, "missing_field"
+    if not isinstance(value["claim_text"], str) or not isinstance(value["evidence_id"], str) or not isinstance(value["quote"], str):
+        return value, "invalid_field_type"
+    # Offsets are optional and advisory: verify_claims derives the authoritative
+    # span from the quote itself. Reject only values of the wrong type.
+    for offset_key in ("char_start", "char_end"):
+        supplied = value.get(offset_key, 0)
+        if isinstance(supplied, bool) or not isinstance(supplied, int):
+            return value, "invalid_field_type"
+        value[offset_key] = supplied
+    if not value["claim_text"] or not value["evidence_id"] or not value["quote"]:
+        return value, "invalid_field_value"
+    try:
+        confidence = float(value.get("confidence", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return value, "invalid_field_type"
+    # Identity comes from the quote, not the offsets: offsets are derived later.
+    claim_id = value.get("claim_id") or stable_id(
+        value["claim_text"],
+        value["evidence_id"],
+        value["quote"],
+        prefix="cl",
+    )
+    claim = Claim(
+        claim_id=str(claim_id),
+        claim_text=value["claim_text"],
+        evidence_id=value["evidence_id"],
+        quote=value["quote"],
+        char_start=value["char_start"],
+        char_end=value["char_end"],
+        confidence=confidence,
+    )
+    return asdict(claim), ""
+
+
+def _serializable_claim(raw_claim: object) -> dict:
+    if isinstance(raw_claim, Claim):
+        return asdict(raw_claim)
+    if isinstance(raw_claim, Mapping):
+        return dict(raw_claim)
+    return {"raw": repr(raw_claim)}

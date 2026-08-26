@@ -1,7 +1,10 @@
 # llm_interface.py
 
+from __future__ import annotations
+
 import os
 import time
+import json
 from abc import ABC, abstractmethod
 from typing import Optional, Dict, Any
 
@@ -282,7 +285,7 @@ class LLMManager:
     
     def _extract_final_query(self, text: str) -> str:
         """Extract the final enhanced query from the response."""
-        import re
+
         lines = text.split('\n')
         for line in lines:
             if 'Final Enhanced Query:' in line:
@@ -298,6 +301,30 @@ class LLMManager:
         """Handle follow-up conversations."""
         return self.generate(follow_up_prompt)
 
+    def generate_json_schema(
+        self,
+        prompt: str,
+        schema_name: str,
+        schema: Dict[str, Any],
+        system_message: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Generate schema-constrained JSON through OpenAI-compatible kwargs."""
+        response_format = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": schema_name,
+                "schema": schema,
+                "strict": True,
+            },
+        }
+        raw = self.generate(prompt, system_message=system_message, response_format=response_format)
+        if raw.startswith("Error generating response:"):
+            raise ValueError(raw)
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            raise ValueError("structured response was not a JSON object")
+        return parsed
+
 # Factory function for easy provider creation
 def create_llm_manager(provider: str = "ollama", model: Optional[str] = None,
                       personality: Optional[str] = None, **kwargs) -> LLMManager:
@@ -309,29 +336,3 @@ def create_llm_manager(provider: str = "ollama", model: Optional[str] = None,
         **kwargs
     }
     return LLMManager(config)
-
-# Backward compatibility functions
-def call_gemma(prompt: str, model: str = "gemma2:2b", personality: Optional[str] = None) -> str:
-    """Backward compatibility function for call_gemma."""
-    manager = create_llm_manager("ollama", model, personality)
-    return manager.generate(prompt)
-
-def rag_final_answer(aggregation_prompt: str, rag_model: str = "gemma", personality: Optional[str] = None) -> str:
-    """Backward compatibility function for rag_final_answer."""
-    manager = create_llm_manager("ollama", "gemma2:2b", personality)
-    return manager.generate_final_answer(aggregation_prompt)
-
-def summarize_text(text: str, max_chars: int = 6000, personality: Optional[str] = None) -> str:
-    """Backward compatibility function for summarize_text."""
-    manager = create_llm_manager("ollama", "gemma2:2b", personality)
-    return manager.summarize_text(text, max_chars)
-
-def chain_of_thought_query_enhancement(query: str, personality: Optional[str] = None) -> str:
-    """Backward compatibility function for chain_of_thought_query_enhancement."""
-    manager = create_llm_manager("ollama", "gemma2:2b", personality)
-    return manager.enhance_query(query)
-
-def follow_up_conversation(follow_up_prompt: str, personality: Optional[str] = None) -> str:
-    """Backward compatibility function for follow_up_conversation."""
-    manager = create_llm_manager("ollama", "gemma2:2b", personality)
-    return manager.follow_up_conversation(follow_up_prompt)

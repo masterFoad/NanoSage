@@ -89,3 +89,6 @@ htmlcov/
 .env.production
 secrets.yaml
 config.local.yaml
+
+# Local test virtualenv
+.venv-test/

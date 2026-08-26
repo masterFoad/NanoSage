@@ -170,12 +170,16 @@ class GrepTool(ScoredTool):
         root = None
         try:
             root = safe_resolve_under(workspace, rel_path)
+            # Report paths relative to the *resolved* workspace. safe_resolve_under resolves
+            # symlinks (on macOS /var -> /private/var), so relative_to(workspace) would raise
+            # for an unresolved workspace argument.
+            display_base = Path(workspace).expanduser().resolve()
             files = [root] if root.is_file() else self._iter_text_files(root)
             for path in files:
                 try:
                     for lineno, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
                         if regex.search(line):
-                            matches.append(f"{path.relative_to(workspace)}:{lineno}: {line[:220]}")
+                            matches.append(f"{path.relative_to(display_base)}:{lineno}: {line[:220]}")
                             if len(matches) >= max_matches:
                                 raise StopIteration
                 except UnicodeDecodeError:

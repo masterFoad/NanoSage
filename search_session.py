@@ -1,6 +1,7 @@
 # search_session.py
 
-import uuid
+from __future__ import annotations
+
 import asyncio
 import heapq
 import time
@@ -9,13 +10,40 @@ import random
 from dataclasses import asdict
 from datetime import datetime, timezone
 
-from knowledge_base import KnowledgeBase, late_interaction_score, load_corpus_from_dir, load_retrieval_model, embed_text
-from web_crawler import search_and_download, parse_any_to_text, sanitize_filename
+
+from chunking import split_text_into_chunks
+from knowledge_base import KnowledgeBase, late_interaction_score, load_corpus_from_dir, load_retrieval_model, embed_text, retrieve
+from web_crawler import search_and_download, sanitize_filename
 import json
 from aggregator import aggregate_results
 from agent_tools import HeuristicAgenticPolicy, LegacyOneShotPolicy, run_policy_tools
-from evidence import SearchBranch, make_evidence_item, mmr_rerank, novelty_against
+from evidence import (
+    SearchBranch,
+    make_evidence_item,
+    mmr_rerank,
+    novelty_against,
+    refresh_search_branch,
+    stable_id,
+    verify_claims,
+)
+from local_fetch import BrowserBudget
 from path_utils import ensure_dir_under, safe_resolve_under
+from prompt_budget import (
+    EvidenceTextBlock,
+    chunk_result_to_block,
+    render_budgeted_prompt,
+    select_blocks_with_budget,
+)
+from sampling import (
+    choose_frontier_index,
+    partition_relative_scores,
+    seed_from_query_id,
+)
+from structured_output import (
+    derive_search_terms,
+    generate_claims_with_fallback,
+    generate_subqueries_with_fallback,
+)
 
 #############################################
 # LLM Interface - Modular provider system
@@ -53,39 +81,7 @@ def split_query(query, max_len=200):
     return [sq for sq in subqueries if sq.strip()]
 
 
-def monte_carlo_sampling_weights(scores):
-    """Return non-negative sampling weights for arbitrary similarity scores."""
-    if not scores:
-        return []
-    min_score = min(scores)
-    shifted = [(score - min_score) + 1e-6 for score in scores]
-    if sum(shifted) <= 0:
-        return [1.0 for _ in scores]
-    return shifted
 
-
-def weighted_sample_without_replacement(items, weights, k):
-    """Small deterministic-bound weighted sampler that never duplicates items."""
-    if k <= 0 or not items:
-        return []
-    remaining = list(zip(items, weights))
-    chosen = []
-    for _ in range(min(k, len(remaining))):
-        total = sum(max(weight, 0.0) for _, weight in remaining)
-        if total <= 0:
-            idx = random.randrange(len(remaining))
-        else:
-            pick = random.uniform(0, total)
-            cumulative = 0.0
-            idx = len(remaining) - 1
-            for i, (_, weight) in enumerate(remaining):
-                cumulative += max(weight, 0.0)
-                if cumulative >= pick:
-                    idx = i
-                    break
-        item, _ = remaining.pop(idx)
-        chosen.append(item)
-    return chosen
 
 ##############################################
 # TOC Node: Represents a branch in the search tree
@@ -116,10 +112,13 @@ class TOCNode:
             'avg_similarity_score': 0.0,
             'max_similarity_score': 0.0,
             'min_similarity_score': 0.0,
-            'monte_carlo_selected': False,
-            'monte_carlo_weight': 0.0,
+            'frontier_sampled': False,
+            'frontier_sample_weight': 0.0,
             'processing_time_ms': 0,
-            'subquery_expansion_count': 0
+            'subquery_expansion_count': 0,
+            'search_terms': '',
+            'verified_claim_count': 0,
+            'rejected_claim_count': 0,
         }
         self.similarity_scores = []       # Individual similarity scores for debugging
         self.parent_query = None          # Reference to parent query for context
@@ -152,11 +151,6 @@ class TOCNode:
             'children': [child.to_dict() for child in self.children] if self.children else []
         }
 
-    def update_metrics(self, **kwargs):
-        """Update metrics with new values"""
-        for key, value in kwargs.items():
-            if key in self.metrics:
-                self.metrics[key] = value
 
     def add_similarity_score(self, score):
         """Add a similarity score and update statistics"""
@@ -211,9 +205,11 @@ def analyze_toc_tree(toc_nodes):
     max_relevance = max(relevance_scores) if relevance_scores else 0
     min_relevance = min(relevance_scores) if relevance_scores else 0
     
-    # Calculate Monte Carlo statistics
-    monte_carlo_selected = sum(1 for node in all_nodes if node.metrics.get('monte_carlo_selected', False))
-    monte_carlo_percentage = (monte_carlo_selected / total_nodes * 100) if total_nodes else 0
+    # Calculate frontier sampling statistics
+    frontier_sampled = sum(1 for node in all_nodes if node.metrics.get('frontier_sampled', False))
+    frontier_sampled_percentage = (frontier_sampled / total_nodes * 100) if total_nodes else 0
+    verified_claims = sum(int(node.metrics.get('verified_claim_count', 0)) for node in all_nodes)
+    rejected_claims = sum(int(node.metrics.get('rejected_claim_count', 0)) for node in all_nodes)
     
     # Calculate content statistics
     total_web_results = sum(node.metrics.get('web_results_count', 0) for node in all_nodes)
@@ -257,10 +253,14 @@ def analyze_toc_tree(toc_nodes):
             'min_relevance': round(min_relevance, 3),
             'relevance_std': round((sum((x - avg_relevance) ** 2 for x in relevance_scores) / len(relevance_scores)) ** 0.5, 3) if relevance_scores else 0
         },
-        'monte_carlo_metrics': {
-            'selected_nodes': monte_carlo_selected,
-            'selection_percentage': round(monte_carlo_percentage, 2),
+        'frontier_sampling_metrics': {
+            'sampled_nodes': frontier_sampled,
+            'sampling_percentage': round(frontier_sampled_percentage, 2),
             'total_candidates': total_nodes
+        },
+        'claim_metrics': {
+            'verified_claims': verified_claims,
+            'rejected_claims': rejected_claims,
         },
         'content_metrics': {
             'total_web_results': total_web_results,
@@ -278,21 +278,26 @@ def analyze_toc_tree(toc_nodes):
         'generated_at': datetime.now().isoformat()
     }
 
-def save_toc_to_json(toc_nodes, output_path, include_analytics=True):
+def save_toc_to_json(toc_nodes, output_path, include_analytics=True, pruned_branches=None, run_metadata=None):
     """
     Save the TOC tree to a JSON file with optional analytics.
     """
     toc_data = {
         'toc_tree': [node.to_dict() for node in toc_nodes] if toc_nodes else [],
+        'pruned_branches': pruned_branches or [],
         'metadata': {
             'total_nodes': len([node for node in toc_nodes]) if toc_nodes else 0,
             'exported_at': datetime.now().isoformat(),
-            'version': '1.0'
+            'version': '1.0',
+            'run': run_metadata or {},
         }
     }
     
     if include_analytics:
         toc_data['analytics'] = analyze_toc_tree(toc_nodes)
+        toc_data['analytics']['branch_selection_metrics'] = {
+            'pruned_branches': len(pruned_branches or []),
+        }
     
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(toc_data, f, indent=2, ensure_ascii=False)
@@ -301,7 +306,7 @@ def save_toc_to_json(toc_nodes, output_path, include_analytics=True):
 
 #########################################################
 # The "SearchSession" class: orchestrate the entire pipeline,
-# including optional Monte Carlo subquery sampling, recursive web search,
+# including optional frontier sampling, recursive web search,
 # TOC tracking, and relevance scoring.
 #########################################################
 
@@ -335,11 +340,15 @@ class SearchSession:
         }
         self.llm_manager = create_llm_manager(**llm_config)
 
-        self.query_id = str(uuid.uuid4())[:8]
+        self.query_id = str(config.get("query_id") or stable_id(self.query, prefix="run"))
+        configured_seed = self.config.get("seed")
+        self.seed = int(configured_seed) if configured_seed is not None else seed_from_query_id(self.query_id)
+        self.rng = random.Random(self.seed)
         self.results_base_dir = self.config.get("results_base_dir", "results")
         self.base_result_dir = str(ensure_dir_under(self.results_base_dir, self.query_id))
+        self.max_chunks_per_doc_in_results = int(self.config.get("max_chunks_per_doc_in_results", 3))
 
-        print(f"[INFO] Initializing SearchSession for query_id={self.query_id}")
+        print(f"[INFO] Initializing SearchSession for query_id={self.query_id}, seed={self.seed}")
 
         # Enhance the query via chain-of-thought.
         self.enhanced_query = self.llm_manager.enhance_query(self.query)
@@ -372,25 +381,45 @@ class SearchSession:
 
         # Create a knowledge base.
         print("[INFO] Creating KnowledgeBase...")
-        self.kb = KnowledgeBase(self.model, self.processor, model_type=self.model_type, device=self.device, text_model=self.text_model)
+        self.kb = KnowledgeBase(
+            self.model,
+            self.processor,
+            model_type=self.model_type,
+            device=self.device,
+            text_model=self.text_model,
+            max_chunks_per_doc_in_results=self.max_chunks_per_doc_in_results,
+        )
 
         # Load local corpus if available.
         self.corpus = []
         if self.corpus_dir:
             print(f"[INFO] Loading local documents from {self.corpus_dir}")
-            local_docs = load_corpus_from_dir(self.corpus_dir, self.model, self.processor, self.device, self.model_type)
+            local_docs = load_corpus_from_dir(
+                self.corpus_dir,
+                self.model,
+                self.processor,
+                self.device,
+                self.model_type,
+                chunk_chars=int(self.config.get("chunk_chars", 1200)),
+                chunk_overlap=int(self.config.get("chunk_overlap", 200)),
+                max_chunks_per_doc=int(self.config.get("max_chunks_per_doc", 40)),
+            )
             self.corpus.extend(local_docs)
         self.kb.add_documents(self.corpus)
 
         # Placeholders for web search results and TOC tree.
         self.web_results = []
         self.evidence_items = []
+        self.claim_ledger = {"kept": [], "rejected": [], "generation_failures": []}
         self.tool_results = []
         self.agent_trace = {}
         self.grouped_web_results = {}
         self.local_results = []
+        self.pruned_branches = []
+        # Browser escalation is expensive, so the allowance is shared across the
+        # whole run and spent in branch-priority order rather than per page.
+        self.browser_budget = BrowserBudget(int(self.config.get("browser_escalation_limit", 0)))
         self.toc_tree = []  # List of TOCNode objects for the initial subqueries
-        self.session_start_time = time.time()
 
     def _get_default_model(self, provider, rag_model):
         """Get default model for the specified provider."""
@@ -407,15 +436,8 @@ class SearchSession:
             self.tool_results = await asyncio.to_thread(self._run_agentic_tools, plain_enhanced_query)
 
         # 1) Generate subqueries from the enhanced query
-        initial_subqueries = split_query(plain_enhanced_query, max_len=self.config.get("max_query_length", 200))
+        initial_subqueries = self._generate_subqueries(plain_enhanced_query)
         print(f"[INFO] Generated {len(initial_subqueries)} initial subqueries from the enhanced query.")
-
-        # 2) Optionally do a Monte Carlo approach to sample subqueries
-        if self.retrieval_active and self.config.get("monte_carlo_search", True):
-            print("[INFO] Using Monte Carlo approach to sample subqueries.")
-            initial_subqueries = self.perform_monte_carlo_subqueries(plain_enhanced_query, initial_subqueries)
-        elif not self.retrieval_active:
-            print("[INFO] Retrieval inactive; skipping Monte Carlo relevance sampling.")
 
         # 3) If web search is enabled and max_depth >= 1, do the recursive expansion
         if self.web_search_enabled and self.max_depth >= 1:
@@ -423,9 +445,8 @@ class SearchSession:
             self.web_results = web_results
             self.grouped_web_results = grouped
             self.toc_tree = toc_nodes
-            # Add new entries to the knowledge base
+            # Branch exploration adds chunk entries to the knowledge base as they are produced.
             self.corpus.extend(web_entries)
-            self.kb.add_documents(web_entries)
         else:
             print("[INFO] Web search is disabled or max_depth < 1, skipping web expansion.")
 
@@ -463,67 +484,49 @@ class SearchSession:
             print(f"[DEBUG] tool={result.name} score={result.score:.3f} ok={result.ok} summary={result.summary}")
         return results
 
-    def perform_monte_carlo_subqueries(self, parent_query, subqueries):
-        """
-        Simple Monte Carlo approach:
-         1) Embed each subquery and compute a relevance score.
-         2) Weighted random selection of a subset (k=3) based on relevance scores.
-        """
-        max_subqs = self.config.get("monte_carlo_samples", 3)
-        print(f"[DEBUG] Monte Carlo: randomly picking up to {max_subqs} subqueries from {len(subqueries)} total.")
-        scored_subqs = []
-        monte_carlo_metrics = {
-            'total_candidates': len(subqueries),
-            'candidate_scores': [],
-            'selection_weights': [],
-            'selected_queries': []
-        }
-        
-        for sq in subqueries:
-            sq_clean = clean_search_query(sq)
-            if not sq_clean:
-                continue
-            node_emb = embed_text(sq_clean, self.model, self.processor, self.model_type, self.device)
-            score = late_interaction_score(self.enhanced_query_embedding, node_emb)
-            scored_subqs.append((sq_clean, score))
-            monte_carlo_metrics['candidate_scores'].append(score)
+    def _generate_subqueries(self, query):
+        legacy = split_query(query, max_len=self.config.get("max_query_length", 200))
+        count = max(1, int(self.config.get("subquery_count", 5)))
+        questions = generate_subqueries_with_fallback(
+            self.llm_manager,
+            query,
+            count=count,
+            fallback=legacy,
+            enabled=bool(self.config.get("structured_subqueries", True)),
+        )
+        return [
+            {
+                "question": clean_search_query(item["question"]),
+                "search_terms": clean_search_query(item.get("search_terms", "")),
+            }
+            for item in questions
+            if clean_search_query(item["question"])
+        ]
 
-        if not scored_subqs:
-            print("[WARN] No valid subqueries found for Monte Carlo. Returning original list.")
-            return subqueries
-
-        # Weighted random choice
-        scores = [s for (_, s) in scored_subqs]
-        weights = monte_carlo_sampling_weights(scores)
-        monte_carlo_metrics['selection_weights'] = weights
-        chosen = weighted_sample_without_replacement(scored_subqs, weights, min(max_subqs, len(scored_subqs)))
-        # Return just the chosen subqueries
-        chosen_sqs = [ch[0] for ch in chosen]
-        monte_carlo_metrics['selected_queries'] = chosen_sqs
-        weights_by_query = {query: weight for (query, _), weight in zip(scored_subqs, weights)}
-        monte_carlo_metrics['selected_weights_by_query'] = {
-            query: weights_by_query.get(query, 0.0)
-            for query in chosen_sqs
-        }
-        monte_carlo_metrics['avg_candidate_score'] = sum(monte_carlo_metrics['candidate_scores']) / len(monte_carlo_metrics['candidate_scores'])
-        monte_carlo_metrics['avg_selected_score'] = sum(score for _, score in chosen) / len(chosen)
-        
-        # Store Monte Carlo metrics for later use
-        self.monte_carlo_metrics = monte_carlo_metrics
-        
-        print(f"[DEBUG] Monte Carlo selected: {chosen_sqs}")
-        print(f"[DEBUG] Monte Carlo metrics: avg_candidate_score={monte_carlo_metrics['avg_candidate_score']:.3f}, avg_selected_score={monte_carlo_metrics['avg_selected_score']:.3f}")
-        return chosen_sqs
+    def _extract_claims_for_branch(self, branch_query, chunk_segments):
+        return generate_claims_with_fallback(self.llm_manager, branch_query, chunk_segments)
 
     def _score_subqueries(self, subqueries, depth=1, parent_query=None, explored_queries=None):
-        """Create relevance/novelty-scored search branches from raw subqueries."""
+        """Create relevance/novelty-scored search branches from subquery records.
+
+        Accepts either `{"question", "search_terms"}` records or bare strings, so
+        recursive expansions and legacy callers both work; missing search terms
+        are derived deterministically.
+        """
         seen = set()
         scored = []
+        terms_by_query = {}
         for sq in subqueries:
-            sq_clean = clean_search_query(sq)
+            if isinstance(sq, dict):
+                raw_question = sq.get("question", "")
+                raw_terms = sq.get("search_terms", "")
+            else:
+                raw_question, raw_terms = sq, ""
+            sq_clean = clean_search_query(raw_question)
             if not sq_clean or sq_clean in seen:
                 continue
             seen.add(sq_clean)
+            terms_by_query[sq_clean] = clean_search_query(raw_terms) or derive_search_terms(sq_clean)
             node_embedding = embed_text(sq_clean, self.model, self.processor, self.model_type, self.device)
             relevance = late_interaction_score(self.enhanced_query_embedding, node_embedding)
             scored.append((sq_clean, relevance))
@@ -531,16 +534,132 @@ class SearchSession:
         ranked = mmr_rerank(scored, lambda_relevance=self.config.get("branch_mmr_lambda", 0.72))
         explored_queries = explored_queries or []
         branches = []
-        selected_for_novelty = list(explored_queries)
         for query, relevance in ranked:
-            novelty = novelty_against(query, selected_for_novelty)
-            selected_for_novelty.append(query)
-            branches.append(SearchBranch(query=query, depth=depth, relevance=relevance, parent_query=parent_query, novelty=novelty))
+            novelty = novelty_against(query, explored_queries)
+            branches.append(SearchBranch(
+                query=query,
+                depth=depth,
+                relevance=relevance,
+                parent_query=parent_query,
+                novelty=novelty,
+                search_terms=terms_by_query.get(query, ""),
+            ))
         return branches
 
     def _push_branch(self, frontier, branch, counter):
         heapq.heappush(frontier, (-branch.priority, counter, branch))
         return counter + 1
+
+    def _enqueue_branches(self, frontier, branches, counter, *, source):
+        if not branches:
+            return counter
+        forced_count = max(1, int(self.config.get("min_branches_if_all_pruned", 3)))
+        kept_indices, threshold, forced = partition_relative_scores(
+            [branch.relevance for branch in branches],
+            margin=max(0.0, float(self.config.get("min_relevance_margin", 0.25))),
+            absolute_floor=self.config.get("min_relevance"),
+            fallback_count=forced_count,
+        )
+        if forced:
+            print(
+                f"[WARN] All {len(branches)} branches would be pruned at relevance cutoff "
+                f"{threshold:.3f}; forcing top {len(kept_indices)} candidates."
+            )
+        kept_index_set = set(kept_indices)
+        for index, branch in enumerate(branches):
+            if index in kept_index_set:
+                counter = self._push_branch(frontier, branch, counter)
+            else:
+                reason = f"below_relative_relevance_cutoff:{threshold:.3f}"
+                self.pruned_branches.append({
+                    "query": branch.query,
+                    "score": round(branch.relevance, 6),
+                    "depth": branch.depth,
+                    "source": source,
+                    "reason": reason,
+                })
+                print(f"[INFO] Pruned branch '{branch.query}' ({branch.relevance:.3f} < {threshold:.3f}).")
+        return counter
+
+    def _pop_frontier_branch(self, frontier, explored_queries):
+        if not frontier:
+            return None, False, 0.0
+        sample_enabled = bool(self.config.get("monte_carlo_search", True))
+        sample_top_n = int(self.config.get("monte_carlo_samples", 3))
+        if not sample_enabled or sample_top_n <= 1 or len(frontier) <= 1:
+            _, _, branch = heapq.heappop(frontier)
+            return branch, False, 0.0
+
+        candidates = []
+        for _ in range(min(sample_top_n, len(frontier))):
+            candidates.append(heapq.heappop(frontier))
+        branches = [entry[2] for entry in candidates]
+        temperature = float(self.config.get("branch_temperature", 0.25))
+        if temperature <= 0:
+            print("[WARN] branch_temperature must be > 0; using deterministic frontier pop.")
+            for entry in candidates[1:]:
+                heapq.heappush(frontier, entry)
+            return candidates[0][2], False, 0.0
+        chosen_index, sampled, chosen_weight = choose_frontier_index(
+            [branch.priority for branch in branches],
+            window_size=len(branches),
+            temperature=temperature,
+            rng=self.rng,
+        )
+        chosen_branch = branches[chosen_index]
+        for index, entry in enumerate(candidates):
+            if index != chosen_index:
+                heapq.heappush(frontier, entry)
+        return chosen_branch, sampled, chosen_weight
+
+    def _refresh_branch_priority(self, branch, explored_queries):
+        return refresh_search_branch(
+            branch,
+            explored_queries,
+            repush_delta=float(self.config.get("stale_priority_repush_delta", 1e-6)),
+        )
+
+    def _build_branch_summary_segments(self, branch_query, branch_corpus_entries):
+        if not branch_corpus_entries:
+            return []
+        retrieved = retrieve(
+            branch_query,
+            branch_corpus_entries,
+            self.model,
+            self.processor,
+            top_k=int(self.config.get("branch_summary_top_k", max(self.top_k, 8))),
+            model_type=self.model_type,
+            device=self.device,
+            text_model=self.text_model,
+            max_chunks_per_doc_in_results=int(self.config.get("max_chunks_per_doc_in_results", 3)),
+        )
+        blocks = []
+        for entry in retrieved:
+            block = chunk_result_to_block(entry)
+            if block is not None:
+                blocks.append(block)
+        selected = select_blocks_with_budget(
+            blocks,
+            int(self.config.get("branch_summary_char_budget", 8000)),
+        )
+        return [f"{block.label}\n{block.text}" for block in selected]
+
+    def _canonical_text_by_evidence_id(self, branch_corpus_entries):
+        paths_by_id = {}
+        for entry in branch_corpus_entries:
+            meta = entry.get("metadata", {})
+            evidence_id = meta.get("parent_evidence_id") or meta.get("evidence_id")
+            path = meta.get("extracted_text_path")
+            if evidence_id and path:
+                paths_by_id[evidence_id] = path
+        canonical = {}
+        for evidence_id, path in paths_by_id.items():
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    canonical[evidence_id] = f.read()
+            except Exception as exc:
+                print(f"[WARN] Failed to read canonical text for claim verification ({evidence_id}): {exc}")
+        return canonical
 
     async def perform_recursive_web_searches(self, subqueries, current_depth=1, parent_query=None):
         """
@@ -557,36 +676,38 @@ class SearchSession:
         explored_queries = []
         frontier = []
         counter = 0
-        min_relevance = self.config.get("min_relevance", 0.5)
         max_branches = int(self.config.get("max_branches", 100))
 
-        for branch in self._score_subqueries(subqueries, current_depth, parent_query):
-            counter = self._push_branch(frontier, branch, counter)
+        counter = self._enqueue_branches(
+            frontier,
+            self._score_subqueries(subqueries, current_depth, parent_query),
+            counter,
+            source="initial",
+        )
 
         while frontier and len(explored_queries) < max_branches:
-            _, _, branch = heapq.heappop(frontier)
+            branch, sampled, sample_weight = self._pop_frontier_branch(frontier, explored_queries)
+            if branch is None:
+                break
+            branch, should_repush = self._refresh_branch_priority(branch, explored_queries)
+            if should_repush:
+                counter = self._push_branch(frontier, branch, counter)
+                continue
             sq_clean = branch.query
             if sq_clean in node_by_query:
                 continue
 
             # Create a TOC node with enhanced tracking
             toc_node = TOCNode(query_text=sq_clean, depth=branch.depth)
-            toc_node.node_id = str(uuid.uuid4())[:8]
+            toc_node.node_id = stable_id(sq_clean, branch.depth, branch.parent_query, prefix="node")
             toc_node.mark_timestamp('created')
             toc_node.parent_query = branch.parent_query if branch.parent_query else self.query
             toc_node.relevance_score = branch.relevance
             toc_node.add_similarity_score(branch.relevance)
             toc_node.metrics['branch_priority'] = round(branch.priority, 6)
             toc_node.metrics['branch_novelty'] = round(branch.novelty, 6)
-
-            # Check if this node was selected by Monte Carlo
-            if hasattr(self, 'monte_carlo_metrics') and sq_clean in self.monte_carlo_metrics.get('selected_queries', []):
-                toc_node.metrics['monte_carlo_selected'] = True
-                toc_node.metrics['monte_carlo_weight'] = self.monte_carlo_metrics.get('selected_weights_by_query', {}).get(sq_clean, 0.0)
-
-            if branch.relevance < min_relevance:
-                print(f"[INFO] Skipping branch '{sq_clean}' due to low relevance ({branch.relevance:.2f} < {min_relevance}).")
-                continue
+            toc_node.metrics['frontier_sampled'] = sampled
+            toc_node.metrics['frontier_sample_weight'] = round(sample_weight, 6)
 
             node_by_query[sq_clean] = toc_node
             if branch.parent_query and branch.parent_query in node_by_query:
@@ -598,18 +719,24 @@ class SearchSession:
             # Create subdirectory
             safe_subquery = sanitize_filename(sq_clean)[:30]
             subquery_dir = str(ensure_dir_under(self.base_result_dir, f"web_{safe_subquery}"))
-            print(f"[DEBUG] Searching web for subquery '{sq_clean}' at depth={branch.depth} priority={branch.priority:.3f}...")
+            # Engines get keywords; the full question stays with the node for
+            # scoring, summarization and claim extraction.
+            search_terms = branch.search_terms or derive_search_terms(sq_clean)
+            toc_node.metrics['search_terms'] = search_terms
+            print(f"[DEBUG] Searching web for '{search_terms}' (branch: {sq_clean[:70]}...) "
+                  f"at depth={branch.depth} priority={branch.priority:.3f}")
 
             # Track web search timing
             toc_node.mark_timestamp('web_search_start')
             web_search_start = time.time()
 
             pages = await search_and_download(
-                keyword=sq_clean,
+                keyword=search_terms,
                 out_dir=subquery_dir,
                 top_n=self.config.get("web_search_limit", 5),
                 concurrency=self.config.get("web_concurrency", 8),
-                include_wikipedia=self.config.get("include_wikipedia", False)
+                include_wikipedia=self.config.get("include_wikipedia", False),
+                browser_budget=self.browser_budget,
             )
 
             web_search_end = time.time()
@@ -626,40 +753,67 @@ class SearchSession:
                 if not file_path or not url:
                     continue
 
-                # Use the web crawler's robust parsing function
-                raw_text = parse_any_to_text(file_path)
+                canonical_path = meta.get("extracted_text_path") or f"{file_path}.extracted.txt"
+                try:
+                    with open(canonical_path, "r", encoding="utf-8") as f:
+                        raw_text = f.read()
+                except Exception as exc:
+                    print(f"[WARN] Canonical extracted text unavailable for '{url}'; skipping page: {exc}")
+                    continue
                 if not raw_text.strip():
                     continue
+                recorded_length = int(meta.get("extracted_text_length", len(raw_text)) or 0)
+                if recorded_length != len(raw_text):
+                    print(
+                        f"[WARN] Canonical text length mismatch for '{url}' "
+                        f"(metadata={recorded_length}, actual={len(raw_text)}); using persisted text."
+                    )
 
-                # Use metadata from sidecar JSON if available, otherwise create snippet
-                snippet = meta.get("text_preview", raw_text[:100].replace('\n', ' ') + "...")
-                limited_text = raw_text[:2048]
+                snippet = meta.get("text_preview", raw_text[:800] + "...")
 
                 try:
-                    emb = embed_text(limited_text, self.model, self.processor, self.model_type, self.device)
                     evidence = make_evidence_item(page, meta, sq_clean, snippet)
                     self.evidence_items.append(evidence)
-
-                    entry = {
-                        "embedding": emb,
-                        "metadata": {
-                            "evidence_id": evidence.evidence_id,
-                            "file_path": file_path,
-                            "type": "webhtml",
-                            "snippet": snippet,
-                            "url": url,
-                            "source_engine": meta.get("source_engine", "unknown"),
-                            "content_type": meta.get("content_type", ""),
-                            "size": meta.get("size", 0),
-                            "published_hint": meta.get("published_hint"),
-                            "downloaded_at": meta.get("downloaded_at")
+                    chunks = split_text_into_chunks(
+                        evidence.evidence_id,
+                        raw_text,
+                        chunk_chars=int(self.config.get("chunk_chars", 1200)),
+                        chunk_overlap=int(self.config.get("chunk_overlap", 200)),
+                        max_chunks_per_doc=int(self.config.get("max_chunks_per_doc", 40)),
+                    )
+                    for chunk in chunks:
+                        emb = embed_text(chunk.text, self.model, self.processor, self.model_type, self.device)
+                        entry = {
+                            "embedding": emb,
+                            "metadata": {
+                                "evidence_id": evidence.evidence_id,
+                                "parent_evidence_id": evidence.evidence_id,
+                                "chunk_id": f"{evidence.evidence_id}#chunk-{chunk.chunk_index}",
+                                "chunk_index": chunk.chunk_index,
+                                "char_start": chunk.char_start,
+                                "char_end": chunk.char_end,
+                                "file_path": file_path,
+                                "extracted_text_path": canonical_path,
+                                "type": "webchunk",
+                                "text": chunk.text,
+                                "snippet": chunk.text[:240],
+                                "url": url,
+                                "branch_query": sq_clean,
+                                "source_engine": meta.get("source_engine", "unknown"),
+                                "content_type": meta.get("content_type", ""),
+                                "size": meta.get("size", 0),
+                                "published_hint": meta.get("published_hint"),
+                                "downloaded_at": meta.get("downloaded_at")
+                            }
                         }
-                    }
-                    branch_corpus_entries.append(entry)
+                        branch_corpus_entries.append(entry)
                     branch_web_results.append({
                         "evidence_id": evidence.evidence_id,
                         "url": url,
                         "snippet": snippet,
+                        "file_path": file_path,
+                        "extracted_text_path": canonical_path,
+                        "content_type": meta.get("content_type", ""),
                         "title": meta.get("title", ""),
                         "source_engine": meta.get("source_engine", "unknown")
                     })
@@ -667,25 +821,48 @@ class SearchSession:
                     print(f"[WARN] Error embedding page '{url}': {e}")
 
             # Summarize and update metrics
-            branch_snippets = " ".join([r.get("snippet", "") for r in branch_web_results])
+            if branch_corpus_entries:
+                self.kb.add_documents(branch_corpus_entries)
+            branch_segments = self._build_branch_summary_segments(sq_clean, branch_corpus_entries)
             summary_start = time.time()
-            toc_node.summary = await asyncio.to_thread(self.llm_manager.summarize_text, branch_snippets)
+            summary_input = "\n\n".join(branch_segments) or "No retrieved evidence chunks fit the branch summary budget."
+            toc_node.summary = await asyncio.to_thread(
+                self.llm_manager.summarize_text,
+                summary_input,
+                int(self.config.get("branch_summary_char_budget", 8000)),
+            )
             summary_end = time.time()
             toc_node.mark_timestamp('summary_generated')
             toc_node.metrics['processing_time_ms'] += int((summary_end - summary_start) * 1000)
+            claims, generation_error = self._extract_claims_for_branch(sq_clean, branch_segments)
+            canonical_text = self._canonical_text_by_evidence_id(branch_corpus_entries)
+            kept_claims, rejected_claims = verify_claims(claims, canonical_text)
+            for record in kept_claims:
+                record["branch_query"] = sq_clean
+            for record in rejected_claims:
+                record["branch_query"] = sq_clean
+            self.claim_ledger["kept"].extend(kept_claims)
+            self.claim_ledger["rejected"].extend(rejected_claims)
+            if generation_error:
+                self.claim_ledger["generation_failures"].append({
+                    "branch_query": sq_clean,
+                    "reason": generation_error,
+                })
+            toc_node.metrics['verified_claim_count'] = len(kept_claims)
+            toc_node.metrics['rejected_claim_count'] = len(rejected_claims)
 
             # Update content metrics
             toc_node.web_results = branch_web_results
             toc_node.corpus_entries = branch_corpus_entries
             toc_node.metrics['web_results_count'] = len(branch_web_results)
             toc_node.metrics['corpus_entries_count'] = len(branch_corpus_entries)
-            toc_node.metrics['total_content_length'] = sum(len(r.get("snippet", "")) for r in branch_web_results)
+            toc_node.metrics['total_content_length'] = sum(len(e.get("metadata", {}).get("snippet", "")) for e in branch_corpus_entries)
 
             additional_subqueries = []
             if branch.depth < self.max_depth:
                 additional_query = await asyncio.to_thread(self.llm_manager.enhance_query, sq_clean)
                 if additional_query and additional_query != sq_clean:
-                    additional_subqueries = split_query(additional_query, max_len=self.config.get("max_query_length", 200))
+                    additional_subqueries = self._generate_subqueries(additional_query)
 
             if additional_subqueries:
                 child_branches = self._score_subqueries(
@@ -695,8 +872,7 @@ class SearchSession:
                     explored_queries=explored_queries,
                 )
                 toc_node.metrics['subquery_expansion_count'] = len(child_branches)
-                for child_branch in child_branches:
-                    counter = self._push_branch(frontier, child_branch, counter)
+                counter = self._enqueue_branches(frontier, child_branches, counter, source=sq_clean)
 
             # Mark node as completed
             toc_node.mark_timestamp('completed')
@@ -706,47 +882,70 @@ class SearchSession:
 
         # Group results by domain for reporting
         grouped = {}
-        for r, e in zip(aggregated_web_results, aggregated_corpus_entries):
+        entry_by_parent = {}
+        for e in aggregated_corpus_entries:
+            meta = e.get("metadata", {})
+            parent_id = meta.get("parent_evidence_id") or meta.get("evidence_id")
+            if parent_id and parent_id not in entry_by_parent:
+                entry_by_parent[parent_id] = e
+        for r in aggregated_web_results:
+            e = entry_by_parent.get(r.get("evidence_id"), {"metadata": {}})
             url = r.get("url", "")
             if url:
                 from urllib.parse import urlparse
                 domain = urlparse(url).netloc
                 if domain not in grouped:
                     grouped[domain] = []
+                meta = e.get("metadata", {})
                 grouped[domain].append({
-                    "evidence_id": r.get("evidence_id") or e["metadata"].get("evidence_id", ""),
+                    "evidence_id": r.get("evidence_id") or meta.get("parent_evidence_id", ""),
                     "url": url,
-                    "file_path": e["metadata"]["file_path"],
-                    "content_type": e["metadata"].get("content_type", ""),
+                    "file_path": meta.get("file_path", ""),
+                    "content_type": meta.get("content_type", ""),
                     "title": r.get("title", ""),
                     "source_engine": r.get("source_engine", "unknown")
                 })
         return aggregated_web_results, aggregated_corpus_entries, grouped, root_nodes
 
     def _summarize_web_results(self, web_results):
+        self._reference_links = sorted({w.get('url') for w in web_results if w.get('url')})
         lines = []
-        reference_urls = []
-        for w in web_results:
-            url = w.get('url')
-            snippet = w.get('snippet')
-            title = w.get('title', '')
-            source_engine = w.get('source_engine', 'unknown')
-            lines.append(f"URL: {url} - Title: {title} - Source: {source_engine} - snippet: {snippet}")
-            reference_urls.append(url)
-        text = "\n".join(lines)
-        # We'll store reference URLs in self._reference_links for final prompt
-        self._reference_links = list(set(reference_urls))  # unique
-        return self.llm_manager.summarize_text(text)
+        for node in self._all_toc_nodes():
+            if node.summary:
+                lines.append(
+                    f"Branch: {node.query_text}\n"
+                    f"Verified claims: {node.metrics.get('verified_claim_count', 0)}\n"
+                    f"Summary: {node.summary}"
+                )
+        return "\n\n".join(lines) or "No web branch summaries were generated."
+
+    def _all_toc_nodes(self):
+        nodes = []
+        pending = list(self.toc_tree)
+        while pending:
+            node = pending.pop(0)
+            nodes.append(node)
+            pending[0:0] = node.children
+        return nodes
 
     def _summarize_local_results(self, local_results):
-        lines = []
+        blocks = []
         for doc in local_results:
             meta = doc.get('metadata', {})
-            file_path = meta.get('file_path')
-            snippet = meta.get('snippet', '')
-            lines.append(f"File: {file_path} snippet: {snippet}")
-        text = "\n".join(lines)
-        return self.llm_manager.summarize_text(text)
+            text = meta.get('text') or meta.get('snippet', '')
+            if not text:
+                continue
+            label = (
+                f"Retrieved source: {meta.get('file_path', '')}\n"
+                f"Evidence ID: {meta.get('parent_evidence_id') or meta.get('evidence_id', '')}\n"
+                f"URL: {meta.get('url', '')}"
+            )
+            blocks.append(EvidenceTextBlock(label, text, float(meta.get('search_score', 0.0))))
+        selected = select_blocks_with_budget(
+            blocks,
+            int(self.config.get("final_retrieval_char_budget", 6000)),
+        )
+        return "\n\n".join(f"{block.label}\n{block.text}" for block in selected) or "No final retrieval results."
 
     def _summarize_tool_results(self, tool_results):
         if not tool_results:
@@ -761,43 +960,53 @@ class SearchSession:
 
     def _build_final_answer(self, summarized_web, summarized_local, summarized_tools="", previous_results_content="", follow_up_convo=""):
         toc_str = build_toc_string(self.toc_tree) if self.toc_tree else "No TOC available."
-        # Build a reference links string from _reference_links, if available
-        reference_links = ""
-        if hasattr(self, "_reference_links"):
-            reference_links = "\n".join(f"- {link}" for link in self._reference_links)
+        blocks = [EvidenceTextBlock("User Query:", self.enhanced_query, 100.0)]
+        for record in self.claim_ledger.get("kept", []):
+            claim = record.get("claim", {})
+            blocks.append(EvidenceTextBlock(
+                f"Verified Claim [{claim.get('evidence_id', '')}] offsets "
+                f"{claim.get('char_start', 0)}-{claim.get('char_end', 0)}:",
+                f"{claim.get('claim_text', '')}\nExact quote: {claim.get('quote', '')}",
+                90.0,
+            ))
+        for node in self._all_toc_nodes():
+            if node.summary:
+                blocks.append(EvidenceTextBlock(
+                    f"Branch Summary: {node.query_text}\nVerified claims: "
+                    f"{node.metrics.get('verified_claim_count', 0)}",
+                    node.summary,
+                    20.0 + float(node.relevance_score),
+                ))
+        if not self.toc_tree and summarized_web:
+            blocks.append(EvidenceTextBlock("Web Summary:", summarized_web, 20.0))
+        blocks.extend([
+            EvidenceTextBlock("Table of Contents:", toc_str, 15.0),
+            EvidenceTextBlock("Final Retrieved Evidence:", summarized_local, 12.0),
+            EvidenceTextBlock("Local Agentic Tool Observations:", summarized_tools, 8.0),
+        ])
+        if previous_results_content:
+            blocks.append(EvidenceTextBlock("Previous Results:", previous_results_content, 6.0))
+        if follow_up_convo:
+            blocks.append(EvidenceTextBlock("Follow-up Context:", follow_up_convo, 6.0))
+        for index, link in enumerate(getattr(self, "_reference_links", [])):
+            blocks.append(EvidenceTextBlock("Reference URL:", link, 1.0 - (index * 1e-6)))
 
-        # Construct final prompt
-        aggregation_prompt = f"""
-You are an expert research analyst. Using all of the data provided below, produce a comprehensive, advanced report of at least 3000 words on the topic. 
-The report should include:
-1) A detailed Table of Contents (based on the search branches), 
-2) Multiple sections, 
-3) In-depth analysis with citations,
-4) A final reference section listing all relevant URLs.
-
-User Query: {self.enhanced_query}
-
-Table of Contents:
-{toc_str}
-
-Summarized Web Results:
-{summarized_web}
-
-Summarized Local Document Results:
-{summarized_local}
-
-Local Agentic Tool Observations:
-{summarized_tools}
-
-Reference Links (unique URLs found):
-{reference_links}
-
-Additionally, incorporate any previously gathered information if available. 
-Provide a thorough discussion covering background, current findings, challenges, and future directions.
-Write the report in clear Markdown with section headings, subheadings, and references.
-
-Report:
-"""
+        evidence_budget = int(self.config.get("final_report_char_budget", 20000))
+        stable_instructions = (
+            "You are an expert research analyst. Produce a comprehensive, advanced Markdown report "
+            "of at least 3000 words using only the supplied NanoSage evidence.\n"
+            "The report should include a detailed table of contents, multiple sections, in-depth "
+            "analysis with citations, and a final reference section listing relevant URLs.\n"
+            "Cover background, current findings, challenges, and future directions. Use section "
+            "headings and subheadings. Do not invent evidence or citations.\n"
+        )
+        aggregation_prompt, _ = render_budgeted_prompt(
+            stable_instructions,
+            blocks,
+            evidence_budget,
+            evidence_heading="Variable NanoSage evidence follows:",
+            suffix="Report:\n",
+        )
         print("[DEBUG] Final RAG prompt constructed. Passing to LLM manager...")
         final_answer = self.llm_manager.generate_final_answer(aggregation_prompt)
         return final_answer
@@ -806,13 +1015,27 @@ Report:
         print("[INFO] Saving final report to disk...")
         
         # Save TOC as JSON for debugging and analysis
-        if self.toc_tree:
+        if self.toc_tree or self.pruned_branches:
             toc_json_path = safe_resolve_under(self.base_result_dir, "toc_analysis.json")
             try:
-                save_toc_to_json(self.toc_tree, toc_json_path, include_analytics=True)
+                save_toc_to_json(
+                    self.toc_tree,
+                    toc_json_path,
+                    include_analytics=True,
+                    pruned_branches=self.pruned_branches,
+                    run_metadata={"query_id": self.query_id, "seed": self.seed},
+                )
                 print(f"[INFO] TOC analysis saved to: {toc_json_path}")
             except Exception as e:
                 print(f"[WARN] Failed to save TOC JSON: {e}")
+
+        run_metadata_path = safe_resolve_under(self.base_result_dir, "run_metadata.json")
+        try:
+            with open(run_metadata_path, "w", encoding="utf-8") as f:
+                json.dump({"query_id": self.query_id, "seed": self.seed}, f, indent=2, ensure_ascii=False)
+            print(f"[INFO] Run metadata saved to: {run_metadata_path}")
+        except Exception as e:
+            print(f"[WARN] Failed to save run metadata: {e}")
 
         if self.evidence_items:
             evidence_path = safe_resolve_under(self.base_result_dir, "evidence_ledger.json")
@@ -822,6 +1045,22 @@ Report:
                 print(f"[INFO] Evidence ledger saved to: {evidence_path}")
             except Exception as e:
                 print(f"[WARN] Failed to save evidence ledger: {e}")
+
+        claim_path = safe_resolve_under(self.base_result_dir, "claim_ledger.json")
+        try:
+            with open(claim_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "metadata": {"query_id": self.query_id, "seed": self.seed},
+                        **self.claim_ledger,
+                    },
+                    f,
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            print(f"[INFO] Claim ledger saved to: {claim_path}")
+        except Exception as e:
+            print(f"[WARN] Failed to save claim ledger: {e}")
 
         if self.tool_results:
             tool_path = safe_resolve_under(self.base_result_dir, "tool_results.json")

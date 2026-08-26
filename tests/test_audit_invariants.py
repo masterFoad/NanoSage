@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import random
 from pathlib import Path
 
 import torch
@@ -8,7 +9,7 @@ from aggregator import aggregate_results
 from knowledge_base import late_interaction_score, retrieve
 from main import load_config
 from path_utils import safe_resolve_under
-from search_session import monte_carlo_sampling_weights, weighted_sample_without_replacement
+from sampling import softmax_sampling_weights, weighted_sample_without_replacement
 
 
 class AuditInvariantTests(unittest.TestCase):
@@ -20,15 +21,17 @@ class AuditInvariantTests(unittest.TestCase):
         self.assertEqual(retrieve("q", [], object(), None, top_k=3, model_type="all-minilm"), [])
         self.assertEqual(retrieve("q", [], object(), None, top_k=0, model_type="all-minilm"), [])
 
-    def test_monte_carlo_weights_are_non_negative_for_negative_scores(self):
-        weights = monte_carlo_sampling_weights([-0.5, 0.0, 0.5])
+    def test_monte_carlo_weights_are_softmax_scaled(self):
+        weights = softmax_sampling_weights([0.90, 0.89, 0.88], temperature=0.25)
         self.assertEqual(len(weights), 3)
         self.assertTrue(all(weight >= 0 for weight in weights))
-        self.assertGreater(sum(weights), 0)
+        probabilities = [weight / sum(weights) for weight in weights]
+        self.assertGreater(probabilities[-1], 0.25)
+        self.assertLess(probabilities[0] / probabilities[-1], 2.0)
 
     def test_weighted_sample_never_duplicates(self):
         items = ["a", "b", "c"]
-        sample = weighted_sample_without_replacement(items, [0.0, 0.0, 0.0], 10)
+        sample = weighted_sample_without_replacement(items, [1.0, 2.0, 3.0], 10, random.Random(7))
         self.assertLessEqual(len(sample), len(items))
         self.assertEqual(len(sample), len(set(sample)))
 

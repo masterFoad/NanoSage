@@ -9,13 +9,29 @@ web_search: false
 web_search_limit: 5
 web_concurrency: 8
 include_wikipedia: false
+browser_escalation_limit: 0    # Max real-browser page renders per run (needs nodriver). 0 disables.
 max_depth: 1
 max_query_length: 200
-min_relevance: 0.5
+structured_subqueries: true      # Use schema-constrained LLM research questions; false uses legacy sentence splitting.
+subquery_count: 5                # Number of distinct research questions requested per expansion.
+min_relevance: null              # Optional absolute floor; null relies on the safer relative cutoff.
+min_relevance_margin: 0.25       # Keep candidates whose score is within this margin of the best candidate.
+min_branches_if_all_pruned: 3    # Force this many top candidates if an absolute floor prunes every branch.
 max_branches: 100
 branch_mmr_lambda: 0.72
-monte_carlo_search: true
-monte_carlo_samples: 3
+branch_temperature: 0.25         # Softmax temperature for stochastic frontier sampling.
+stale_priority_repush_delta: 0.000001 # Requeue when refreshed novelty lowers priority by at least this amount.
+monte_carlo_search: true         # Legacy key: now enables stochastic frontier sampling, not raw prefiltering.
+monte_carlo_samples: 3           # Legacy key: top-of-frontier sampling window; 0 disables stochastic sampling.
+seed: null                       # Optional RNG seed; null derives a deterministic seed from the query id.
+chunk_chars: 1200                # Target characters per persisted extracted-text chunk.
+chunk_overlap: 200               # Overlap characters between adjacent chunks.
+max_chunks_per_doc: 40           # Maximum embedded chunks produced for one downloaded page.
+max_chunks_per_doc_in_results: 3 # Maximum chunk hits from one document in one retrieval result set.
+branch_summary_top_k: 8          # Candidate chunks retrieved for each branch summary.
+branch_summary_char_budget: 8000 # Whole-chunk character budget for each branch summary prompt.
+final_retrieval_char_budget: 6000 # Whole-result character budget for final-query retrieval evidence.
+final_report_char_budget: 20000  # Variable-evidence budget for the final report prompt.
 rag_model: gemma
 
 llm:

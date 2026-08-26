@@ -1,9 +1,15 @@
+from __future__ import annotations
+
 import os
 import io
 import torch
-import numpy as np
 import fitz  # PyMuPDF
 from PIL import Image
+
+from chunking import normalize_extracted_text, split_text_into_chunks
+from evidence import stable_id
+
+from retrieval_utils import select_scored_results
 
 ############################
 # Load & Configure Retrieval
@@ -153,7 +159,17 @@ def late_interaction_score(query_emb, doc_emb):
     return float(torch.dot(q_norm, d_norm))
 
 
-def retrieve(query, corpus, model, processor, top_k=3, model_type="colpali", device="cpu", text_model=None):
+def retrieve(
+    query,
+    corpus,
+    model,
+    processor,
+    top_k=3,
+    model_type="colpali",
+    device="cpu",
+    text_model=None,
+    max_chunks_per_doc_in_results=3,
+):
     if top_k <= 0 or not corpus:
         return []
 
@@ -170,8 +186,12 @@ def retrieve(query, corpus, model, processor, top_k=3, model_type="colpali", dev
             source = metadata.get("file_path") or metadata.get("url") or f"corpus[{idx}]"
             raise ValueError(f"Incompatible embedding for {source}: {exc}") from exc
         scores.append(score)
-    top_indices = np.argsort(scores)[-top_k:][::-1]
-    return [corpus[i] for i in top_indices]
+    return select_scored_results(
+        corpus,
+        scores,
+        top_k=top_k,
+        max_per_document=max_chunks_per_doc_in_results,
+    )
 
 
 ##################################
@@ -244,7 +264,22 @@ def _pdf_pages_to_images(pdf_path: str, max_pages: int = 4, dpi: int = 144):
         return []
 
 
-def load_corpus_from_dir(corpus_dir, model, processor, device="cpu", model_type="colpali"):
+# Text formats the README documents as supported. Keep this list and the README in
+# sync: an unlisted extension is skipped silently, which looks like empty retrieval.
+PLAIN_TEXT_EXTENSIONS = (".txt", ".md", ".markdown", ".py", ".json", ".yaml", ".yml", ".csv", ".rst")
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg")
+
+
+def load_corpus_from_dir(
+    corpus_dir,
+    model,
+    processor,
+    device="cpu",
+    model_type="colpali",
+    chunk_chars=1200,
+    chunk_overlap=200,
+    max_chunks_per_doc=40,
+):
     """
     Scan 'corpus_dir' for txt, pdf, and image files, embed their content,
     and return a list of { 'embedding': torch.Tensor(cpu), 'metadata':... }.
@@ -255,6 +290,7 @@ def load_corpus_from_dir(corpus_dir, model, processor, device="cpu", model_type=
     corpus = []
     if not corpus_dir or not os.path.isdir(corpus_dir):
         return corpus
+    skipped = []
 
     for filename in os.listdir(corpus_dir):
         file_path = os.path.join(corpus_dir, filename)
@@ -265,13 +301,13 @@ def load_corpus_from_dir(corpus_dir, model, processor, device="cpu", model_type=
         text = ""
         img_embs = []
 
-        # --- TXT ---
-        if ext.endswith(".txt"):
+        # --- Plain text formats ---
+        if ext.endswith(PLAIN_TEXT_EXTENSIONS):
             try:
                 with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                     text = f.read()
             except Exception as e:
-                print(f"[WARN] Failed to read TXT {file_path}: {e}")
+                print(f"[WARN] Failed to read text file {file_path}: {e}")
                 continue
 
         # --- PDF ---
@@ -301,7 +337,7 @@ def load_corpus_from_dir(corpus_dir, model, processor, device="cpu", model_type=
                         img_embs.append(e)
 
         # --- Images ---
-        elif ext.endswith((".png", ".jpg", ".jpeg")):
+        elif ext.endswith(IMAGE_EXTENSIONS):
             if model_type in ("siglip", "clip"):
                 try:
                     img = Image.open(file_path).convert("RGB")
@@ -321,36 +357,68 @@ def load_corpus_from_dir(corpus_dir, model, processor, device="cpu", model_type=
                     print(f"[WARN] OCR failed for image {file_path}: {e}")
                     continue
         else:
-            # skip unsupported
+            # Skipping silently here reads downstream as "retrieval found nothing",
+            # which is very hard to diagnose from the report. Say so out loud.
+            skipped.append(filename)
             continue
 
-        # Build final embedding
+        # Build entries. Text is indexed as chunks so retrieved local evidence carries
+        # real body text into the report; a single pooled vector could only ever supply
+        # a 100-character snippet, which reads downstream as "no evidence".
         try:
-            embs = []
-            if text.strip():
-                text_emb = _embed_long_text(text, model, processor, model_type, device)
-                if text_emb is not None:
-                    embs.append(text_emb)
-            embs.extend(img_embs)
+            entries_before = len(corpus)
+            canonical = normalize_extracted_text(text) if text.strip() else ""
+            if canonical:
+                evidence_id = stable_id(file_path, prefix="local")
+                chunks = split_text_into_chunks(
+                    evidence_id,
+                    canonical,
+                    chunk_chars=chunk_chars,
+                    chunk_overlap=chunk_overlap,
+                    max_chunks_per_doc=max_chunks_per_doc,
+                )
+                for chunk in chunks:
+                    chunk_emb = _embed_long_text(chunk.text, model, processor, model_type, device)
+                    if chunk_emb is None:
+                        continue
+                    corpus.append({
+                        "embedding": chunk_emb.cpu(),
+                        "metadata": {
+                            "file_path": file_path,
+                            "type": "localchunk",
+                            "evidence_id": f"{evidence_id}#chunk-{chunk.chunk_index}",
+                            "parent_evidence_id": evidence_id,
+                            "chunk_index": chunk.chunk_index,
+                            "char_start": chunk.char_start,
+                            "char_end": chunk.char_end,
+                            "text": chunk.text,
+                            "snippet": chunk.text[:240],
+                        },
+                    })
 
-            if not embs:
+            if img_embs:
+                corpus.append({
+                    "embedding": _pool_mean(img_embs).cpu(),
+                    "metadata": {
+                        "file_path": file_path,
+                        "type": "local",
+                        "snippet": (text[:100].replace('\n', ' ') + "...") if text else "",
+                    },
+                })
+
+            if len(corpus) == entries_before:
                 # Nothing usable
                 continue
-
-            final_emb = _pool_mean(embs)
-            snippet = (text[:100].replace('\n', ' ') + "...") if text else ""
-
-            corpus.append({
-                "embedding": final_emb.cpu(),
-                "metadata": {
-                    "file_path": file_path,
-                    "type": "local",
-                    "snippet": snippet
-                }
-            })
         except Exception as e:
             print(f"[WARN] Skipping embedding for local file {file_path} due to error: {e}")
 
+    if skipped:
+        print(
+            f"[WARN] Skipped {len(skipped)} unsupported file(s) in {corpus_dir}: "
+            f"{', '.join(sorted(skipped)[:8])}"
+            f"{' ...' if len(skipped) > 8 else ''}"
+        )
+    print(f"[INFO] Loaded {len(corpus)} document(s) from {corpus_dir}")
     return corpus
 
 
@@ -362,18 +430,20 @@ class KnowledgeBase:
     """
     Same public API with explicit embedding-compatibility checks.
     """
-    def __init__(self, model, processor, model_type="colpali", device="cpu", text_model=None):
+    def __init__(self, model, processor, model_type="colpali", device="cpu", text_model=None,
+                 max_chunks_per_doc_in_results=3):
         self.model = model
         self.processor = processor
         self.model_type = model_type
         self.device = device
         self.text_model = text_model  # Kept for backward-compatible constructor calls.
         self.corpus = []
+        self.max_chunks_per_doc_in_results = max_chunks_per_doc_in_results
 
     def add_documents(self, entries):
         self.corpus.extend(entries)
 
-    def search(self, query, top_k=3):
+    def search(self, query, top_k=3, max_chunks_per_doc_in_results=None):
         return retrieve(
             query,
             self.corpus,
@@ -382,5 +452,10 @@ class KnowledgeBase:
             top_k=top_k,
             model_type=self.model_type,
             device=self.device,
-            text_model=self.text_model
+            text_model=self.text_model,
+            max_chunks_per_doc_in_results=(
+                self.max_chunks_per_doc_in_results
+                if max_chunks_per_doc_in_results is None
+                else max_chunks_per_doc_in_results
+            ),
         )

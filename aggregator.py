@@ -27,7 +27,7 @@ def aggregate_results(query_id, enhanced_query, web_results, local_results, fina
         f.write(f"{enhanced_query}\n\n")
         
         
-        f.write(f"# Final Aggregated Answer (RAG)\n\n")
+        f.write("# Final Aggregated Answer (RAG)\n\n")
         f.write(final_answer.strip() + "\n\n")
 
         f.write("## Web Search Results\n")

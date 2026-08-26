@@ -3,7 +3,6 @@ import unittest
 from pathlib import Path
 
 from agent_tools import (
-    GitExploreTool,
     GrepTool,
     HeuristicAgenticPolicy,
     ReadFileLinesTool,

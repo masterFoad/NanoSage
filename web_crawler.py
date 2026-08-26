@@ -7,14 +7,16 @@ A plug-and-play upgrade to your original script that:
 - Uses a pluggable multi-engine interface (DDG → SearxNG → optional Wikipedia/ArXiv).
 - Reranks for quality, recency, and domain diversity.
 - Downloads concurrently with retries, robots.txt respect, size caps, and URL hashing.
-- Extracts clean text (trafilatura → readability-lxml → BeautifulSoup), and PDFs via PyMuPDF.
+- Extracts clean text (markdown via local_fetch → trafilatura → readability-lxml →
+  BeautifulSoup), and PDFs via PyMuPDF.
 - Emits a sidecar JSON metadata file for each download.
-- Includes a tiny CLI: see bottom (`python metasearch_crawler.py --help`).
+- Includes a tiny CLI: see bottom (`python web_crawler.py --help`).
 
 Dependencies (all free):
   pip install duckduckgo-search aiohttp bs4 trafilatura readability-lxml python-dateutil pymupdf
 Optional:
-  pip install aiohttp-client-cache pytesseract ocrmypdf
+  pip install curl_cffi lxml   # hardened fetching + keyless search, see local_fetch
+  pip install pytesseract ocrmypdf
 
 Notes / Ethics:
 - Be polite: robots.txt, modest concurrency, and do not hammer public SearxNG instances.
@@ -24,21 +26,19 @@ Notes / Ethics:
 from __future__ import annotations
 
 import os
-import re
-import io
-import sys
 import json
-import time
-import math
 import hashlib
 import random
 import asyncio
 import logging
-from dataclasses import dataclass, asdict
-from typing import List, Dict, Any, Optional, Iterable, Tuple
+from dataclasses import dataclass
+from typing import List, Dict, Any, Optional, Tuple
 from urllib.parse import urlparse, quote_plus
 from urllib.robotparser import RobotFileParser
 from datetime import datetime
+
+import local_fetch
+from canonical_text import persist_canonical_text
 
 # --- Third-party imports (soft-fail where possible) ---
 try:
@@ -48,7 +48,7 @@ except Exception:  # pragma: no cover
 
 try:
     import aiohttp
-except Exception as e:
+except Exception:
     raise SystemExit("aiohttp is required. pip install aiohttp")
 
 try:
@@ -76,12 +76,6 @@ try:
     from readability import Document
 except Exception:
     Document = None
-
-# Optional caching
-try:
-    import aiohttp_client_cache
-except Exception:
-    aiohttp_client_cache = None
 
 # Tavily search
 try:
@@ -321,52 +315,25 @@ class WikipediaEngine(BaseEngine):
         return results
 
 
-class BraveSearchEngine(BaseEngine):
-    name = "brave"
-    
+class LocalFetchEngine(BaseEngine):
+    """Keyless search through an impersonated TLS session (see local_fetch)."""
+
+    name = "localfetch"
+
     async def search(self, keyword: str, *, max_results: int = 25) -> List[SearchResult]:
-        """Brave Search API - free tier available"""
-        results: List[SearchResult] = []
-        
-        # Brave Search API (free tier: 2000 queries/month)
-        api_url = "https://api.search.brave.com/res/v1/web/search"
-        headers = {
-            "Accept": "application/json",
-            "Accept-Encoding": "gzip",
-            "X-Subscription-Token": "BSA"  # Free tier token
-        }
-        
-        params = {
-            "q": keyword,
-            "count": min(max_results, 20),
-            "offset": 0,
-            "mkt": "en-US",
-            "safesearch": "moderate"
-        }
-        
-        timeout = aiohttp.ClientTimeout(total=10)
-        
+        if not local_fetch.search_available():
+            return []
         try:
-            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-                async with session.get(api_url, params=params) as r:
-                    if r.status == 200:
-                        data = await r.json()
-                        web_results = data.get("web", {}).get("results", [])
-                        
-                        for item in web_results:
-                            results.append(SearchResult(
-                                title=item.get("title", ""),
-                                href=item.get("url", ""),
-                                body=item.get("description", ""),
-                                source=self.name
-                            ))
-                    else:
-                        logging.warning("Brave API error: status %s", r.status)
-                        
-        except Exception as e:
-            logging.warning("Brave search error: %s", e)
-            
-        return results
+            hits = await local_fetch.search(keyword, limit=max_results)
+        except Exception as exc:
+            logging.warning("localfetch search error: %s", exc)
+            return []
+        return [
+            SearchResult(title=hit.title, href=hit.url, body=hit.snippet, source=self.name)
+            for hit in hits
+            if hit.url
+        ]
+
 
 
 class TavilyEngine(BaseEngine):
@@ -511,10 +478,36 @@ async def robots_allowed(session: aiohttp.ClientSession, url: str, user_agent: s
 
 
 async def fetch_one(session: aiohttp.ClientSession, url: str, dest_dir: str,
-                    max_bytes: int = 8_000_000, tries: int = 3) -> Optional[Dict[str, Any]]:
+                    max_bytes: int = 8_000_000, tries: int = 3,
+                    browser_budget: Optional["local_fetch.BrowserBudget"] = None) -> Optional[Dict[str, Any]]:
     if not await robots_allowed(session, url):
         logging.info("Blocked by robots: %s", url)
         return None
+
+    # Hardened path first: a real Chrome TLS fingerprint gets through where the
+    # plain aiohttp request below is fingerprinted and refused. PDFs keep the
+    # aiohttp path, which streams bytes and honours the size cap.
+    if local_fetch.fetch_available() and not url.lower().endswith(".pdf"):
+        try:
+            page = await local_fetch.fetch_page(url, budget=browser_budget)
+        except local_fetch.BlockedError as exc:
+            # Falling through to plain aiohttp here would fetch and store the
+            # challenge page itself, which then reads downstream as evidence.
+            logging.info("Dropping blocked URL %s (%s)", url, exc)
+            return None
+        except Exception as exc:
+            logging.debug("localfetch fetch failed for %s: %s", url, exc)
+            page = None
+        if page is not None and page.html:
+            raw = page.html.encode("utf-8", errors="replace")
+            if len(raw) <= max_bytes:
+                fpath = os.path.join(dest_dir, f"{url_hash(url)}.html")
+                with open(fpath, "wb") as f:
+                    f.write(raw)
+                if page.escalation:
+                    logging.info("localfetch tier=%s (%s): %s", page.tier, page.escalation, url)
+                return {"url": url, "file_path": fpath, "content_type": "text/html",
+                        "size": len(raw), "fetch_tier": page.tier}
 
     backoff = 0.25
     for attempt in range(tries):
@@ -546,33 +539,26 @@ async def fetch_one(session: aiohttp.ClientSession, url: str, dest_dir: str,
                     f.write(raw)
                 return {"url": url, "file_path": fpath, "content_type": ctype, "size": len(raw)}
         except Exception as e:
+            # Swallowing this silently made failed downloads indistinguishable from
+            # pages that simply had no text. Log the cause, then back off.
+            logging.debug("Download attempt %d/%d failed for %s: %s", attempt + 1, tries, url, e)
             await asyncio.sleep(backoff + random.random() * 0.2)
             backoff *= 2
+    logging.info("Giving up on %s after %d attempts", url, tries)
     return None
 
 
-async def download_many(urls: List[str], output_dir: str, concurrency: int = 12) -> List[Dict[str, Any]]:
+async def download_many(urls: List[str], output_dir: str, concurrency: int = 12,
+                        browser_budget: Optional["local_fetch.BrowserBudget"] = None) -> List[Dict[str, Any]]:
     os.makedirs(output_dir, exist_ok=True)
     sem = asyncio.Semaphore(concurrency)
-
-    # Optional cache for speed-ups across runs
-    if aiohttp_client_cache:
-        try:
-            # Try the newer API first
-            from aiohttp_client_cache import SQLiteBackend
-            cache_backend = SQLiteBackend(cache_name="metasearch_cache", expire_after=3600)
-            # Note: This would need to be integrated with the session, but for now we'll skip caching
-            pass
-        except (ImportError, AttributeError):
-            # Fall back gracefully if caching isn't available
-            pass
 
     timeout = aiohttp.ClientTimeout(total=25)
     headers = {"User-Agent": "Mozilla/5.0", "Accept-Encoding": "gzip, deflate, br", "Accept": "*/*"}
     async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
         async def _task(u: str):
             async with sem:
-                return await fetch_one(session, u, output_dir)
+                return await fetch_one(session, u, output_dir, browser_budget=browser_budget)
         results = await asyncio.gather(*[_task(u) for u in urls])
     return [r for r in results if r]
 
@@ -601,7 +587,18 @@ def parse_pdf_to_text(pdf_file_path: str, max_pages: int = 10) -> str:
 
 
 def extract_html_text(html_bytes: bytes) -> str:
-    # 1) trafilatura (best effort)
+    # 1) Markdown extraction. Headings and lists survive canonical normalization,
+    #    so the chunker can split on real boundaries instead of mid-sentence.
+    try:
+        markdown = local_fetch.extract_text(
+            html_bytes.decode("utf-8", errors="replace") if isinstance(html_bytes, bytes) else html_bytes,
+            "",
+        )
+        if markdown.strip():
+            return markdown
+    except Exception:
+        pass
+    # 2) trafilatura plain text
     if trafilatura is not None:
         try:
             txt = trafilatura.extract(html_bytes, include_comments=False, include_links=False)
@@ -666,7 +663,8 @@ class EngineManager:
 
 async def search_and_download(keyword: str, out_dir: str = "downloaded_webpages",
                               top_n: int = 20, concurrency: int = 12,
-                              include_wikipedia: bool = False) -> List[Dict[str, Any]]:
+                              include_wikipedia: bool = False,
+                              browser_budget: Optional["local_fetch.BrowserBudget"] = None) -> List[Dict[str, Any]]:
     engines: List[BaseEngine] = []
     
     # 1) Tavily first (most reliable, requires API key)
@@ -676,17 +674,22 @@ async def search_and_download(keyword: str, out_dir: str = "downloaded_webpages"
         except Exception as e:
             logging.warning("Tavily engine failed: %s", e)
     
-    # 2) DDG fallback (fast, free)
+    # 2) Keyless local search. Preferred over the plain-HTTP engines below: it
+    #    impersonates a real Chrome TLS fingerprint, so it is not blocked as often.
+    if local_fetch.search_available():
+        engines.append(LocalFetchEngine())
+
+    # 3) DDG fallback (fast, free)
     if DDGS is not None:
         try:
             engines.append(DuckDuckGoEngine())
         except Exception:
             pass
-    
-    # 3) SearxNG fallback (auto-discover a healthy instance)
+
+    # 4) SearxNG fallback (auto-discover a healthy instance)
     engines.append(SearxNGEngine())
     
-    # 4) Optional: Wikipedia for strong canonical pages
+    # 5) Optional: Wikipedia for strong canonical pages
     if include_wikipedia:
         engines.append(WikipediaEngine())
 
@@ -696,7 +699,7 @@ async def search_and_download(keyword: str, out_dir: str = "downloaded_webpages"
     ranked = rerank(raw_results, keyword, per_domain_cap=3)[:top_n]
     urls = [r.href for r in ranked if r.href]
 
-    pages = await download_many(urls, out_dir, concurrency=concurrency)
+    pages = await download_many(urls, out_dir, concurrency=concurrency, browser_budget=browser_budget)
 
     # parse + sidecar metadata. Match by URL instead of zipping ranked/pages:
     # downloads can be skipped, and zip would misattribute source metadata.
@@ -707,14 +710,27 @@ async def search_and_download(keyword: str, out_dir: str = "downloaded_webpages"
         if r is None:
             logging.warning("Downloaded page has no ranked metadata match: %s", page["url"])
             continue
-        text = parse_any_to_text(page["file_path"]) or ""
-        preview = (text[:800] + "…") if text else ""
+        extracted = parse_any_to_text(page["file_path"]) or ""
+        if local_fetch.is_challenge_text(extracted):
+            # "Checking your browser..." extracts to real characters, so the usual
+            # empty-text guard lets it through and it becomes a cited source.
+            logging.info("Discarding challenge/interstitial page: %s", page["url"])
+            continue
+        try:
+            artifact = persist_canonical_text(page["file_path"], extracted)
+        except Exception as e:
+            logging.warning("Failed to write extracted text sidecar for %s: %s", page["file_path"], e)
+            continue
+        text = artifact.text
+        preview = (text[:800] + "...") if text else ""
         sidecar = {
             "keyword": keyword,
             "source_engine": r.source,
             "title": r.title,
             "url": page["url"],
             "file_path": page["file_path"],
+            "extracted_text_path": artifact.path,
+            "extracted_text_length": artifact.length,
             "content_type": page.get("content_type", ""),
             "size": page.get("size", 0),
             "downloaded_at": datetime.utcnow().isoformat() + "Z",
