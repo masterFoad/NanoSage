@@ -205,6 +205,78 @@ def generate_subqueries_with_fallback(
         return _from_fallback()
 
 
+def build_gap_subquery_prompt(
+    branch_question: str,
+    branch_summary: str,
+    verified_claim_texts: Sequence[str],
+    *,
+    count: int,
+) -> str | None:
+    """Build a child-question prompt from what a branch did and did not establish."""
+    summary = " ".join((branch_summary or "").split())
+    claims = [" ".join(text.split()) for text in verified_claim_texts if text and text.strip()]
+    if not summary and not claims:
+        return None
+    claim_lines = "\n".join(f"- {claim}" for claim in claims) or "- No verified claims."
+    return (
+        "Generate follow-up research questions that close gaps left by one completed research branch.\n"
+        f"Return exactly {max(1, int(count))} standalone, specific, non-overlapping questions. "
+        "Target facts, comparisons, mechanisms, constraints, or source evidence that the branch summary "
+        "says are missing or that the verified claims do not establish. Do not merely paraphrase the "
+        "branch question, summary, or established claims.\n\n"
+        "For each question also give `search_terms`: the short query you would type into a search engine. "
+        f"Use at most {MAX_SEARCH_TERMS} words, keep distinctive nouns and technical terms, and do not "
+        "write a sentence.\n\n"
+        f"Branch question:\n{branch_question}\n\n"
+        f"Branch evidence summary:\n{summary or 'No branch summary.'}\n\n"
+        f"Verified claim texts:\n{claim_lines}"
+    )
+
+
+def generate_gap_subqueries_with_fallback(
+    llm_manager: Any,
+    branch_question: str,
+    branch_summary: str,
+    verified_claim_texts: Sequence[str],
+    *,
+    count: int,
+    fallback: Sequence[str],
+    enabled: bool = True,
+    log: Callable[[str], None] = print,
+) -> list[dict[str, str]]:
+    """Generate gap-directed children in one schema call, or local fallback."""
+    def _from_fallback() -> list[dict[str, str]]:
+        return [{"question": item, "search_terms": derive_search_terms(item)} for item in fallback]
+
+    prompt = build_gap_subquery_prompt(
+        branch_question,
+        branch_summary,
+        verified_claim_texts,
+        count=count,
+    )
+    if not enabled or prompt is None:
+        return _from_fallback()
+    count = max(1, int(count))
+    schema = dict(SUBQUERY_SCHEMA["schema"])
+    schema["properties"] = dict(schema["properties"])
+    schema["properties"]["questions"] = dict(schema["properties"]["questions"])
+    schema["properties"]["questions"].update({"minItems": count, "maxItems": count})
+    try:
+        parsed = llm_manager.generate_json_schema(
+            prompt,
+            SUBQUERY_SCHEMA["name"],
+            schema,
+            system_message="Return only schema-valid JSON.",
+        )
+        questions = parse_subquery_response(json.dumps(parsed), count)
+        if len(questions) != count:
+            raise ValueError(f"expected {count} distinct questions, received {len(questions)}")
+        return questions
+    except Exception as exc:
+        log(f"[WARN] Gap-driven subquery generation unavailable; using local fallback: {exc}")
+        return _from_fallback()
+
+
 def generate_claims_with_fallback(
     llm_manager: Any,
     branch_query: str,

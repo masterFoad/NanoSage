@@ -223,3 +223,55 @@ Deliberately left open:
   This wants the eval harness before a policy.
 - Retrieval is dense-only (MiniLM cosine, no lexical lane, no rerank), which is
   weakest exactly where research queries turn on exact identifiers and figures.
+
+## Claim coverage and gap-driven expansion
+
+- **Claim extraction no longer reuses the summary slice.** Branch summaries keep
+  their small relevance-ranked input, while claim extraction reads separate
+  whole-chunk batches. Documents are interleaved and chunk positions are spread
+  across each document before batching, so overlapping neighbors cannot consume
+  every bounded slot before another source or section is read.
+- **Claim-extraction cost is explicit.** `claim_extraction_char_budget` defaults
+  to 8000 characters per call and `max_claim_extraction_calls_per_branch` defaults
+  to 4 calls. `toc_analysis.json` records the calls run and chunks covered for
+  each node. A failed batch is recorded with its call index while successful
+  batches still reach span verification.
+- **Overlapping passes do not duplicate ledger claims.** Proposed claims collapse
+  by the same stable `(claim_text, evidence_id, quote)` identity used for
+  `claim_id` before verification derives canonical offsets.
+- **Recursive expansion now follows evidence gaps.** When a branch has a summary
+  or verified claims, one schema-constrained call asks for child questions aimed
+  at what those findings failed to establish. This replaces the old enhancement
+  plus subquery pair for evidence-bearing branches; branches with neither signal
+  retain that legacy fallback.
+
+Deliberately left open:
+
+- Chunk coverage is deterministic document/position diversity, not semantic
+  clustering or an embedding-based novelty reranker.
+- The configured call ceiling can still leave unread chunks in very large
+  branches; the per-node coverage metrics make that tradeoff measurable.
+- Gap-directed questions are grounded in summaries and verified claim text, but
+  there is no cross-branch contradiction or global knowledge-gap planner.
+
+### Follow-up: gap expansion must degrade to the enhancement path
+
+`generate_gap_subqueries_with_fallback` is called with an empty local fallback, so a
+failed or empty gap call returned no questions and the branch expanded to *nothing* --
+strictly worse than the `enhance_query` path it replaced. `_generate_branch_expansion`
+now falls through to that path when the gap call yields no usable questions.
+
+Measured A/B on the same query, before and after both algorithmic fixes:
+
+| | before | after |
+|---|---|---|
+| chunks read for claims | 36 of 317 (11%) | 85 of 115 (74%) |
+| verified claims | 26 | 44 |
+| branches with zero claims | 2 of 6 | 1 of 6 |
+| report | 2,653 words | 3,980 words |
+| citations outside the ledger | 0 | 0 |
+
+The gap-driven expansion produced, as a child of the peak-VRAM branch, "What is the
+per-token KV-cache VRAM growth rate (GB per context token) for a 35B-class MoE model" --
+the same quantity an earlier run's report flagged as missing in its own Limitations
+section, and which the root-relevance pruner had discarded at 0.356.

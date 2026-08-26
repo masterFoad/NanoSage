@@ -35,6 +35,8 @@ max_chunks_per_doc: 40           # Maximum embedded chunks produced for one down
 max_chunks_per_doc_in_results: 3 # Maximum chunk hits from one document in one retrieval result set.
 branch_summary_top_k: 8          # Candidate chunks retrieved for each branch summary.
 branch_summary_char_budget: 8000 # Whole-chunk character budget for each branch summary prompt.
+claim_extraction_char_budget: 8000 # Whole-chunk character budget for each claim-extraction call.
+max_claim_extraction_calls_per_branch: 4 # At most 4 claim-extraction LLM calls per branch.
 final_retrieval_char_budget: 6000 # Whole-result character budget for final-query retrieval evidence.
 final_report_char_budget: 20000  # Variable-evidence budget for the final report prompt.
 rag_model: gemma

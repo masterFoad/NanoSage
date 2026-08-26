@@ -3,8 +3,10 @@ from __future__ import annotations
 import unittest
 
 from structured_output import (
+    build_gap_subquery_prompt,
     derive_search_terms,
     generate_claims_with_fallback,
+    generate_gap_subqueries_with_fallback,
     generate_subqueries_with_fallback,
     parse_claim_response,
     parse_subquery_response,
@@ -108,6 +110,53 @@ class StructuredOutputTests(unittest.TestCase):
             count=2,
             fallback=["legacy"],
             enabled=False,
+            log=lambda _: None,
+        )
+        self.assertEqual(questions, [{"question": "legacy", "search_terms": "legacy"}])
+        self.assertEqual(manager.calls, [])
+
+    def test_gap_prompt_targets_missing_findings_and_includes_verified_claims(self):
+        prompt = build_gap_subquery_prompt(
+            "How do the systems compare?",
+            "The evidence does not establish memory use on either GPU.",
+            ["System A uses sparse routing."],
+            count=2,
+        )
+        self.assertIn("close gaps", prompt)
+        self.assertIn("does not establish memory use", prompt)
+        self.assertIn("System A uses sparse routing", prompt)
+        self.assertIn("exactly 2", prompt)
+        self.assertIn("search_terms", prompt)
+
+    def test_gap_prompt_is_absent_when_branch_has_no_summary_or_claims(self):
+        self.assertIsNone(build_gap_subquery_prompt("Question?", "  ", [], count=3))
+
+    def test_gap_subquery_generator_uses_one_schema_call(self):
+        manager = FakeManager({"questions": [
+            {"question": "What memory measurements are missing?", "search_terms": "GPU memory measurements"},
+        ]})
+        questions = generate_gap_subqueries_with_fallback(
+            manager,
+            "How do the systems compare?",
+            "Memory use was not established.",
+            ["System A uses sparse routing."],
+            count=1,
+            fallback=[],
+            log=lambda _: None,
+        )
+        self.assertEqual(questions[0]["search_terms"], "GPU memory measurements")
+        self.assertEqual(len(manager.calls), 1)
+        self.assertIn("Memory use was not established", manager.calls[0][0])
+
+    def test_gap_subquery_generator_does_not_call_llm_for_empty_branch(self):
+        manager = FakeManager(error=AssertionError("must not be called"))
+        questions = generate_gap_subqueries_with_fallback(
+            manager,
+            "Question?",
+            "",
+            [],
+            count=1,
+            fallback=["legacy"],
             log=lambda _: None,
         )
         self.assertEqual(questions, [{"question": "legacy", "search_terms": "legacy"}])

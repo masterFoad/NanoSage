@@ -3,10 +3,20 @@ from __future__ import annotations
 import unittest
 
 from chunking import normalize_extracted_text
-from evidence import Claim, verify_claims
+from evidence import Claim, deduplicate_claims, stable_id, verify_claims
 
 
 class ClaimVerificationTests(unittest.TestCase):
+    def test_deduplicate_claims_uses_stable_content_identity(self):
+        duplicate = {"claim_text": "Alpha is first", "evidence_id": "ev_1", "quote": "Alpha"}
+        distinct = {"claim_text": "Beta is second", "evidence_id": "ev_1", "quote": "Beta"}
+        claims = deduplicate_claims([duplicate, dict(duplicate), distinct])
+        self.assertEqual(claims, [duplicate, distinct])
+        self.assertEqual(
+            stable_id("Alpha is first", "ev_1", "Alpha", prefix="cl"),
+            verify_claims([duplicate], {"ev_1": "Alpha and Beta"})[0][0]["claim"]["claim_id"],
+        )
+
     def test_keeps_exact_span_under_canonical_normalization(self):
         text = normalize_extracted_text("Alpha   beta gamma.")
         start = text.index("beta")

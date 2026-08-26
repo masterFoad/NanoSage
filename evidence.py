@@ -272,6 +272,34 @@ def verify_claims(
     return kept, rejected
 
 
+def deduplicate_claims(
+    claims: Sequence[Claim | Mapping[str, object]],
+) -> list[Claim | Mapping[str, object]]:
+    """Keep the first claim for each stable text/evidence/quote identity."""
+    deduplicated: list[Claim | Mapping[str, object]] = []
+    seen: set[str] = set()
+    for claim in claims:
+        if isinstance(claim, Claim):
+            identity = stable_id(claim.claim_text, claim.evidence_id, claim.quote, prefix="cl")
+        elif isinstance(claim, Mapping) and all(
+            isinstance(claim.get(key), str) for key in ("claim_text", "evidence_id", "quote")
+        ):
+            identity = stable_id(
+                claim.get("claim_text"),
+                claim.get("evidence_id"),
+                claim.get("quote"),
+                prefix="cl",
+            )
+        else:
+            deduplicated.append(claim)
+            continue
+        if identity in seen:
+            continue
+        seen.add(identity)
+        deduplicated.append(claim)
+    return deduplicated
+
+
 def _coerce_claim_record(raw_claim: Claim | Mapping[str, object]) -> tuple[dict, str]:
     if isinstance(raw_claim, Claim):
         value = asdict(raw_claim)

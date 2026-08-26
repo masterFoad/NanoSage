@@ -201,3 +201,48 @@ class CitationAuditTests(unittest.TestCase):
         audit = audit_citations("", ["https://example.org/a"])
         self.assertEqual(audit["cited_total"], 0)
         self.assertEqual(audit["ledger_urls_uncited"], ["https://example.org/a"])
+
+
+class BranchExpansionFallbackTests(unittest.TestCase):
+    """A failed gap call must not leave a branch with no children at all."""
+
+    @staticmethod
+    def _session(gap_questions, enhanced="enhanced question"):
+        from search_session import SearchSession
+
+        session = SearchSession.__new__(SearchSession)
+        session.config = {"subquery_count": 2, "structured_subqueries": True}
+
+        class FakeManager:
+            def enhance_query(self, query):
+                return enhanced
+
+        session.llm_manager = FakeManager()
+        session._generate_subqueries = lambda query: [
+            {"question": f"legacy child of {query}", "search_terms": "legacy child"}
+        ]
+        import search_session as module
+
+        module.generate_gap_subqueries_with_fallback = (
+            lambda *args, **kwargs: gap_questions
+        )
+        return session, module
+
+    def test_gap_questions_are_used_when_available(self):
+        session, module = self._session([{"question": "gap child?", "search_terms": "gap child"}])
+        try:
+            expansion = session._generate_branch_expansion("branch?", "a summary", [])
+        finally:
+            module.generate_gap_subqueries_with_fallback = _REAL_GAP
+        self.assertEqual(expansion[0]["question"], "gap child?")
+
+    def test_empty_gap_result_falls_back_to_the_enhancement_path(self):
+        session, module = self._session([])
+        try:
+            expansion = session._generate_branch_expansion("branch?", "a summary", [])
+        finally:
+            module.generate_gap_subqueries_with_fallback = _REAL_GAP
+        self.assertEqual(expansion, [{"question": "legacy child of enhanced question", "search_terms": "legacy child"}])
+
+
+from structured_output import generate_gap_subqueries_with_fallback as _REAL_GAP  # noqa: E402

@@ -21,6 +21,7 @@ from evidence import (
     SearchBranch,
     audit_citations,
     blend_relevance,
+    deduplicate_claims,
     make_evidence_item,
     mmr_rerank,
     novelty_against,
@@ -33,6 +34,7 @@ from path_utils import ensure_dir_under, safe_resolve_under
 from prompt_budget import (
     EvidenceTextBlock,
     chunk_result_to_block,
+    group_blocks_for_coverage,
     render_budgeted_prompt,
     select_blocks_with_budget,
 )
@@ -44,6 +46,7 @@ from sampling import (
 from structured_output import (
     derive_search_terms,
     generate_claims_with_fallback,
+    generate_gap_subqueries_with_fallback,
     generate_subqueries_with_fallback,
 )
 
@@ -121,6 +124,8 @@ class TOCNode:
             'search_terms': '',
             'verified_claim_count': 0,
             'rejected_claim_count': 0,
+            'claim_extraction_calls': 0,
+            'claim_extraction_chunks_covered': 0,
         }
         self.similarity_scores = []       # Individual similarity scores for debugging
         self.parent_query = None          # Reference to parent query for context
@@ -577,8 +582,81 @@ class SearchSession:
             if clean_search_query(item["question"])
         ]
 
-    def _extract_claims_for_branch(self, branch_query, chunk_segments):
-        return generate_claims_with_fallback(self.llm_manager, branch_query, chunk_segments)
+    def _build_claim_extraction_batches(self, branch_corpus_entries):
+        blocks = []
+        for entry in branch_corpus_entries:
+            block = chunk_result_to_block(entry)
+            if block is not None:
+                blocks.append(block)
+        grouped = group_blocks_for_coverage(
+            blocks,
+            int(self.config.get("claim_extraction_char_budget", 8000)),
+            int(self.config.get("max_claim_extraction_calls_per_branch", 4)),
+        )
+        return [
+            [f"{block.label}\n{block.text}" for block in group]
+            for group in grouped
+        ]
+
+    def _extract_claims_for_branch(self, branch_query, branch_corpus_entries):
+        batches = self._build_claim_extraction_batches(branch_corpus_entries)
+        claims = []
+        failures = []
+        for call_index, chunk_segments in enumerate(batches, start=1):
+            extracted, error = generate_claims_with_fallback(
+                self.llm_manager,
+                branch_query,
+                chunk_segments,
+            )
+            claims.extend(extracted)
+            if error:
+                failures.append({"call_index": call_index, "reason": error})
+        return (
+            deduplicate_claims(claims),
+            failures,
+            len(batches),
+            sum(len(batch) for batch in batches),
+        )
+
+    def _generate_branch_expansion(self, branch_query, branch_summary, kept_claims):
+        claim_texts = [
+            record.get("claim", {}).get("claim_text", "")
+            for record in kept_claims
+            if isinstance(record, dict)
+        ]
+        claim_texts = [text for text in claim_texts if isinstance(text, str) and text.strip()]
+        count = max(1, int(self.config.get("subquery_count", 5)))
+        has_findings = bool((branch_summary or "").strip() or claim_texts)
+        if has_findings and bool(self.config.get("structured_subqueries", True)):
+            questions = generate_gap_subqueries_with_fallback(
+                self.llm_manager,
+                branch_query,
+                branch_summary,
+                claim_texts,
+                count=count,
+                fallback=[],
+            )
+            expansion = [
+                {
+                    "question": clean_search_query(item["question"]),
+                    "search_terms": clean_search_query(item.get("search_terms", "")),
+                }
+                for item in questions
+                if clean_search_query(item["question"])
+            ]
+            if expansion:
+                return expansion
+            # A failed gap call must cost this branch better children, not all of
+            # them: without this the branch expands to nothing at all, which is
+            # worse than the enhancement path it replaced.
+            print(f"[WARN] Gap expansion produced no questions for '{branch_query[:60]}'; using enhancement path.")
+
+        # With no findings there is no evidence-grounded gap to describe, so the
+        # legacy enhancement path remains the only useful expansion signal.
+        additional_query = self.llm_manager.enhance_query(branch_query)
+        if not additional_query or additional_query == branch_query:
+            return []
+        return self._generate_subqueries(additional_query)
 
     def _score_subqueries(self, subqueries, depth=1, parent_query=None, explored_queries=None):
         """Create relevance/novelty-scored search branches from subquery records.
@@ -1012,7 +1090,11 @@ class SearchSession:
             summary_end = time.time()
             toc_node.mark_timestamp('summary_generated')
             toc_node.metrics['processing_time_ms'] += int((summary_end - summary_start) * 1000)
-            claims, generation_error = self._extract_claims_for_branch(sq_clean, branch_segments)
+            claims, generation_failures, extraction_calls, covered_chunks = await asyncio.to_thread(
+                self._extract_claims_for_branch,
+                sq_clean,
+                branch_corpus_entries,
+            )
             canonical_text = self._canonical_text_by_evidence_id(branch_corpus_entries)
             kept_claims, rejected_claims = verify_claims(claims, canonical_text)
             for record in kept_claims:
@@ -1021,13 +1103,15 @@ class SearchSession:
                 record["branch_query"] = sq_clean
             self.claim_ledger["kept"].extend(kept_claims)
             self.claim_ledger["rejected"].extend(rejected_claims)
-            if generation_error:
+            for failure in generation_failures:
                 self.claim_ledger["generation_failures"].append({
                     "branch_query": sq_clean,
-                    "reason": generation_error,
+                    **failure,
                 })
             toc_node.metrics['verified_claim_count'] = len(kept_claims)
             toc_node.metrics['rejected_claim_count'] = len(rejected_claims)
+            toc_node.metrics['claim_extraction_calls'] = extraction_calls
+            toc_node.metrics['claim_extraction_chunks_covered'] = covered_chunks
 
             # Update content metrics
             toc_node.web_results = branch_web_results
@@ -1039,12 +1123,14 @@ class SearchSession:
             additional_subqueries = []
             if branch.depth < self.max_depth:
                 try:
-                    additional_query = await asyncio.to_thread(self.llm_manager.enhance_query, sq_clean)
+                    additional_subqueries = await asyncio.to_thread(
+                        self._generate_branch_expansion,
+                        sq_clean,
+                        toc_node.summary,
+                        kept_claims,
+                    )
                 except LLMGenerationError as exc:
                     print(f"[WARN] Branch expansion skipped for '{sq_clean[:60]}': {exc}")
-                    additional_query = ""
-                if additional_query and additional_query != sq_clean:
-                    additional_subqueries = self._generate_subqueries(additional_query)
 
             if additional_subqueries:
                 child_branches = self._score_subqueries(
