@@ -19,6 +19,8 @@ from aggregator import aggregate_results
 from agent_tools import HeuristicAgenticPolicy, LegacyOneShotPolicy, run_policy_tools
 from evidence import (
     SearchBranch,
+    audit_citations,
+    blend_relevance,
     make_evidence_item,
     mmr_rerank,
     novelty_against,
@@ -49,7 +51,7 @@ from structured_output import (
 # LLM Interface - Modular provider system
 #############################################
 
-from llm_interface import create_llm_manager, default_model_for_provider
+from llm_interface import LLMGenerationError, create_llm_manager, default_model_for_provider
 
 
 def utc_now_iso():
@@ -411,6 +413,12 @@ class SearchSession:
         self.web_results = []
         self.evidence_items = []
         self.claim_ledger = {"kept": [], "rejected": [], "generation_failures": []}
+        # Sources fetched but dropped before chunking, and branches whose summary
+        # call failed. Both were previously invisible: a dropped page looked like
+        # a page that was never found, and a failed summary looked like a summary.
+        self.dropped_sources = []
+        self.summary_failures = []
+        self.citation_audit = {}
         self.tool_results = []
         self.agent_trace = {}
         self.grouped_web_results = {}
@@ -432,7 +440,7 @@ class SearchSession:
         print(f"[INFO] Starting session with query_id={self.query_id}, max_depth={self.max_depth}")
         plain_enhanced_query = clean_search_query(self.enhanced_query)
 
-        if self.config.get("agentic_tools", {}).get("enabled", False):
+        if self._agentic_tools_active():
             self.tool_results = await asyncio.to_thread(self._run_agentic_tools, plain_enhanced_query)
 
         # 1) Generate subqueries from the enhanced query
@@ -461,6 +469,72 @@ class SearchSession:
         final_answer = await asyncio.to_thread(self._build_final_answer, summarized_web, summarized_local, summarized_tools)
         print("[INFO] Finished building final advanced report.")
         return final_answer
+
+    def save_diagnostics(self):
+        """Persist every ledger, without writing a report.
+
+        Called on its own when final generation fails: the branch tree, evidence
+        and verified claims are the expensive part of a run and stay usable for a
+        retry, but nothing that is not a report gets written as one.
+        """
+        if self.toc_tree or self.pruned_branches:
+            toc_json_path = safe_resolve_under(self.base_result_dir, "toc_analysis.json")
+            try:
+                save_toc_to_json(
+                    self.toc_tree,
+                    toc_json_path,
+                    include_analytics=True,
+                    pruned_branches=self.pruned_branches,
+                    run_metadata={"query_id": self.query_id, "seed": self.seed},
+                )
+                print(f"[INFO] TOC analysis saved to: {toc_json_path}")
+            except Exception as e:
+                print(f"[WARN] Failed to save TOC JSON: {e}")
+
+        self._write_json("run_metadata.json", {"query_id": self.query_id, "seed": self.seed}, "Run metadata")
+        if self.evidence_items:
+            self._write_json("evidence_ledger.json", [asdict(item) for item in self.evidence_items], "Evidence ledger")
+        if self.dropped_sources:
+            self._write_json("dropped_sources.json", self.dropped_sources, "Dropped source ledger")
+        if self.citation_audit:
+            self._write_json("citation_audit.json", self.citation_audit, "Citation audit")
+        self._write_json(
+            "claim_ledger.json",
+            {
+                "metadata": {"query_id": self.query_id, "seed": self.seed},
+                **self.claim_ledger,
+                "summary_failures": self.summary_failures,
+            },
+            "Claim ledger",
+        )
+        if self.tool_results:
+            self._write_json("tool_results.json", [result.to_dict() for result in self.tool_results], "Tool results")
+        if self.agent_trace:
+            self._write_json("agent_trace.json", self.agent_trace, "Agent trace")
+
+    def _write_json(self, filename, payload, label):
+        path = safe_resolve_under(self.base_result_dir, filename)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+            print(f"[INFO] {label} saved to: {path}")
+        except Exception as e:
+            print(f"[WARN] Failed to save {label.lower()}: {e}")
+
+    def _agentic_tools_active(self):
+        """Local read-only tools only help when the run is about local material.
+
+        With `workspace: "."` and no corpus, a question about GPU inference spent
+        eight calls grepping NanoSage's own source and fed the results to the
+        report as evidence.
+        """
+        tool_config = self.config.get("agentic_tools", {})
+        if not tool_config.get("enabled", False):
+            return False
+        if bool(tool_config.get("require_corpus", True)) and not self.corpus_dir:
+            print("[INFO] Agentic tools skipped: no corpus_dir (set agentic_tools.require_corpus: false to force).")
+            return False
+        return True
 
     def _run_agentic_tools(self, query):
         tool_config = self.config.get("agentic_tools", {})
@@ -516,6 +590,16 @@ class SearchSession:
         seen = set()
         scored = []
         terms_by_query = {}
+        # A depth-2 question about a mechanism is necessarily further from the
+        # root query than a restatement of the root, so root-only scoring prunes
+        # exactly the specific sub-questions deep search exists to reach. Blend
+        # in similarity to the parent branch so a child is judged against what it
+        # was spawned to investigate.
+        parent_weight = float(self.config.get("parent_relevance_weight", 0.4))
+        parent_weight = min(1.0, max(0.0, parent_weight))
+        parent_embedding = None
+        if parent_query and parent_weight > 0:
+            parent_embedding = embed_text(parent_query, self.model, self.processor, self.model_type, self.device)
         for sq in subqueries:
             if isinstance(sq, dict):
                 raw_question = sq.get("question", "")
@@ -528,7 +612,12 @@ class SearchSession:
             seen.add(sq_clean)
             terms_by_query[sq_clean] = clean_search_query(raw_terms) or derive_search_terms(sq_clean)
             node_embedding = embed_text(sq_clean, self.model, self.processor, self.model_type, self.device)
-            relevance = late_interaction_score(self.enhanced_query_embedding, node_embedding)
+            root_relevance = late_interaction_score(self.enhanced_query_embedding, node_embedding)
+            relevance = blend_relevance(
+                root_relevance,
+                late_interaction_score(parent_embedding, node_embedding) if parent_embedding is not None else None,
+                parent_weight,
+            )
             scored.append((sq_clean, relevance))
 
         ranked = mmr_rerank(scored, lambda_relevance=self.config.get("branch_mmr_lambda", 0.72))
@@ -618,6 +707,40 @@ class SearchSession:
             explored_queries,
             repush_delta=float(self.config.get("stale_priority_repush_delta", 1e-6)),
         )
+
+    def _select_branch_sources(self, page_candidates):
+        """Split a branch's fetched pages into kept and dropped.
+
+        Returns `(kept, dropped, cutoff)`. With gating disabled every page is
+        kept. `min_sources_per_branch` protects a branch that found only weak
+        evidence from being emptied: a thin branch should report thin evidence,
+        not silently vanish.
+        """
+        if not page_candidates:
+            return [], [], 0.0
+        margin = float(self.config.get("source_relevance_margin", 0.0))
+        floor = self.config.get("min_source_relevance")
+        if margin <= 0 and not floor:
+            return list(page_candidates), [], 0.0
+        keep_at_least = max(1, int(self.config.get("min_sources_per_branch", 2)))
+        kept_indices, cutoff, forced = partition_relative_scores(
+            [candidate["relevance"] for candidate in page_candidates],
+            margin=max(0.0, margin),
+            absolute_floor=float(floor) if floor else None,
+            fallback_count=keep_at_least,
+        )
+        ranked = sorted(range(len(page_candidates)), key=lambda i: (-page_candidates[i]["relevance"], i))
+        kept_index_set = set(kept_indices)
+        # Top up rather than let a whole branch fall below an absolute floor.
+        for index in ranked:
+            if len(kept_index_set) >= keep_at_least:
+                break
+            kept_index_set.add(index)
+        if forced:
+            print(f"[WARN] All branch sources fell below cutoff {cutoff:.3f}; keeping the top {len(kept_index_set)}.")
+        kept = [candidate for index, candidate in enumerate(page_candidates) if index in kept_index_set]
+        dropped = [candidate for index, candidate in enumerate(page_candidates) if index not in kept_index_set]
+        return kept, dropped, cutoff
 
     def _build_branch_summary_segments(self, branch_query, branch_corpus_entries):
         if not branch_corpus_entries:
@@ -737,6 +860,7 @@ class SearchSession:
                 concurrency=self.config.get("web_concurrency", 8),
                 include_wikipedia=self.config.get("include_wikipedia", False),
                 browser_budget=self.browser_budget,
+                scholarly_search=bool(self.config.get("scholarly_search", True)),
             )
 
             web_search_end = time.time()
@@ -744,6 +868,23 @@ class SearchSession:
             toc_node.metrics['processing_time_ms'] += int((web_search_end - web_search_start) * 1000)
             branch_web_results = []
             branch_corpus_entries = []
+            # Ranking decides what to download; nothing decided what to keep. Pages
+            # that ranked top-N on domain reputation but are off-topic still cost a
+            # summary and a claim-extraction call, and crowd out on-topic chunks.
+            #
+            # The cut is relative to the best page this branch actually found, the
+            # same shape as branch pruning. An absolute threshold looks principled
+            # and is not: measured page scores cluster tightly (0.45-0.71 on one
+            # run), so a fixed cut lands mid-cluster and starves whole branches.
+            source_margin = float(self.config.get("source_relevance_margin", 0.0))
+            source_floor = self.config.get("min_source_relevance")
+            gating_sources = source_margin > 0 or source_floor
+            branch_embedding = (
+                embed_text(sq_clean, self.model, self.processor, self.model_type, self.device)
+                if gating_sources
+                else None
+            )
+            page_candidates = []
             for page in pages:
                 if not page:
                     continue
@@ -773,7 +914,6 @@ class SearchSession:
 
                 try:
                     evidence = make_evidence_item(page, meta, sq_clean, snippet)
-                    self.evidence_items.append(evidence)
                     chunks = split_text_into_chunks(
                         evidence.evidence_id,
                         raw_text,
@@ -781,8 +921,13 @@ class SearchSession:
                         chunk_overlap=int(self.config.get("chunk_overlap", 200)),
                         max_chunks_per_doc=int(self.config.get("max_chunks_per_doc", 40)),
                     )
+                    page_entries = []
+                    page_relevance = None
                     for chunk in chunks:
                         emb = embed_text(chunk.text, self.model, self.processor, self.model_type, self.device)
+                        if branch_embedding is not None:
+                            chunk_relevance = late_interaction_score(branch_embedding, emb)
+                            page_relevance = chunk_relevance if page_relevance is None else max(page_relevance, chunk_relevance)
                         entry = {
                             "embedding": emb,
                             "metadata": {
@@ -806,19 +951,43 @@ class SearchSession:
                                 "downloaded_at": meta.get("downloaded_at")
                             }
                         }
-                        branch_corpus_entries.append(entry)
-                    branch_web_results.append({
-                        "evidence_id": evidence.evidence_id,
-                        "url": url,
-                        "snippet": snippet,
-                        "file_path": file_path,
-                        "extracted_text_path": canonical_path,
-                        "content_type": meta.get("content_type", ""),
-                        "title": meta.get("title", ""),
-                        "source_engine": meta.get("source_engine", "unknown")
+                        page_entries.append(entry)
+                    # A page is judged by its best chunk: a long source with one
+                    # directly relevant section is still worth keeping.
+                    page_candidates.append({
+                        "evidence": evidence,
+                        "entries": page_entries,
+                        "relevance": float(page_relevance) if page_relevance is not None else 0.0,
+                        "web_result": {
+                            "evidence_id": evidence.evidence_id,
+                            "url": url,
+                            "snippet": snippet,
+                            "file_path": file_path,
+                            "extracted_text_path": canonical_path,
+                            "content_type": meta.get("content_type", ""),
+                            "title": meta.get("title", ""),
+                            "source_engine": meta.get("source_engine", "unknown")
+                        },
                     })
                 except Exception as e:
                     print(f"[WARN] Error embedding page '{url}': {e}")
+
+            kept_pages, dropped_pages, source_cutoff = self._select_branch_sources(page_candidates)
+            for candidate in kept_pages:
+                self.evidence_items.append(candidate["evidence"])
+                branch_corpus_entries.extend(candidate["entries"])
+                branch_web_results.append(candidate["web_result"])
+            for candidate in dropped_pages:
+                result = candidate["web_result"]
+                self.dropped_sources.append({
+                    "branch_query": sq_clean,
+                    "url": result["url"],
+                    "title": result["title"],
+                    "source_engine": result["source_engine"],
+                    "relevance": round(candidate["relevance"], 6),
+                    "cutoff": round(source_cutoff, 6),
+                })
+                print(f"[INFO] Dropped off-topic source ({candidate['relevance']:.3f} < {source_cutoff:.3f}): {result['url']}")
 
             # Summarize and update metrics
             if branch_corpus_entries:
@@ -826,11 +995,20 @@ class SearchSession:
             branch_segments = self._build_branch_summary_segments(sq_clean, branch_corpus_entries)
             summary_start = time.time()
             summary_input = "\n\n".join(branch_segments) or "No retrieved evidence chunks fit the branch summary budget."
-            toc_node.summary = await asyncio.to_thread(
-                self.llm_manager.summarize_text,
-                summary_input,
-                int(self.config.get("branch_summary_char_budget", 8000)),
-            )
+            try:
+                toc_node.summary = await asyncio.to_thread(
+                    self.llm_manager.summarize_text,
+                    summary_input,
+                    int(self.config.get("branch_summary_char_budget", 8000)),
+                    sq_clean,
+                )
+            except LLMGenerationError as exc:
+                # An empty summary costs this branch's contribution to the report.
+                # Writing the failure text as the summary would have fed it to the
+                # report generator as evidence, so record it and move on.
+                toc_node.summary = ""
+                self.summary_failures.append({"branch_query": sq_clean, "reason": str(exc)})
+                print(f"[WARN] Branch summary failed for '{sq_clean[:60]}': {exc}")
             summary_end = time.time()
             toc_node.mark_timestamp('summary_generated')
             toc_node.metrics['processing_time_ms'] += int((summary_end - summary_start) * 1000)
@@ -860,7 +1038,11 @@ class SearchSession:
 
             additional_subqueries = []
             if branch.depth < self.max_depth:
-                additional_query = await asyncio.to_thread(self.llm_manager.enhance_query, sq_clean)
+                try:
+                    additional_query = await asyncio.to_thread(self.llm_manager.enhance_query, sq_clean)
+                except LLMGenerationError as exc:
+                    print(f"[WARN] Branch expansion skipped for '{sq_clean[:60]}': {exc}")
+                    additional_query = ""
                 if additional_query and additional_query != sq_clean:
                     additional_subqueries = self._generate_subqueries(additional_query)
 
@@ -961,10 +1143,16 @@ class SearchSession:
     def _build_final_answer(self, summarized_web, summarized_local, summarized_tools="", previous_results_content="", follow_up_convo=""):
         toc_str = build_toc_string(self.toc_tree) if self.toc_tree else "No TOC available."
         blocks = [EvidenceTextBlock("User Query:", self.enhanced_query, 100.0)]
+        # Claims carry an evidence_id; the reference list carries URLs. Without a
+        # mapping between them in the same prompt, the report is asked to cite
+        # sources it has no way to attribute, so the URL travels with the claim.
+        url_by_evidence_id = {item.evidence_id: item.url for item in self.evidence_items}
         for record in self.claim_ledger.get("kept", []):
             claim = record.get("claim", {})
+            evidence_id = claim.get("evidence_id", "")
+            source_url = url_by_evidence_id.get(evidence_id, "")
             blocks.append(EvidenceTextBlock(
-                f"Verified Claim [{claim.get('evidence_id', '')}] offsets "
+                f"Verified Claim [{evidence_id}] source {source_url or 'unknown'} offsets "
                 f"{claim.get('char_start', 0)}-{claim.get('char_end', 0)}:",
                 f"{claim.get('claim_text', '')}\nExact quote: {claim.get('quote', '')}",
                 90.0,
@@ -999,6 +1187,11 @@ class SearchSession:
             "analysis with citations, and a final reference section listing relevant URLs.\n"
             "Cover background, current findings, challenges, and future directions. Use section "
             "headings and subheadings. Do not invent evidence or citations.\n"
+            "Cite every claim with the source URL given on its own Verified Claim line, or a URL "
+            "from the Reference URL list. Those are the only citable sources: a URL that merely "
+            "appears inside a page's text is that page's own outbound link and must never be "
+            "cited. State plainly where the evidence does not settle a question rather than "
+            "filling the gap.\n"
         )
         aggregation_prompt, _ = render_budgeted_prompt(
             stable_instructions,
@@ -1009,77 +1202,18 @@ class SearchSession:
         )
         print("[DEBUG] Final RAG prompt constructed. Passing to LLM manager...")
         final_answer = self.llm_manager.generate_final_answer(aggregation_prompt)
+        self.citation_audit = audit_citations(final_answer, url_by_evidence_id.values())
+        off_ledger = self.citation_audit["cited_outside_ledger"]
+        if off_ledger:
+            print(f"[WARN] Report cited {len(off_ledger)} URL(s) that are not fetched sources: {', '.join(off_ledger[:3])}")
         return final_answer
 
     def save_report(self, final_answer, previous_results=None, follow_up_convo=None):
         print("[INFO] Saving final report to disk...")
-        
-        # Save TOC as JSON for debugging and analysis
-        if self.toc_tree or self.pruned_branches:
-            toc_json_path = safe_resolve_under(self.base_result_dir, "toc_analysis.json")
-            try:
-                save_toc_to_json(
-                    self.toc_tree,
-                    toc_json_path,
-                    include_analytics=True,
-                    pruned_branches=self.pruned_branches,
-                    run_metadata={"query_id": self.query_id, "seed": self.seed},
-                )
-                print(f"[INFO] TOC analysis saved to: {toc_json_path}")
-            except Exception as e:
-                print(f"[WARN] Failed to save TOC JSON: {e}")
+        if not isinstance(final_answer, str) or not final_answer.strip():
+            raise ValueError("refusing to save an empty final answer as a report")
+        self.save_diagnostics()
 
-        run_metadata_path = safe_resolve_under(self.base_result_dir, "run_metadata.json")
-        try:
-            with open(run_metadata_path, "w", encoding="utf-8") as f:
-                json.dump({"query_id": self.query_id, "seed": self.seed}, f, indent=2, ensure_ascii=False)
-            print(f"[INFO] Run metadata saved to: {run_metadata_path}")
-        except Exception as e:
-            print(f"[WARN] Failed to save run metadata: {e}")
-
-        if self.evidence_items:
-            evidence_path = safe_resolve_under(self.base_result_dir, "evidence_ledger.json")
-            try:
-                with open(evidence_path, "w", encoding="utf-8") as f:
-                    json.dump([asdict(item) for item in self.evidence_items], f, indent=2, ensure_ascii=False)
-                print(f"[INFO] Evidence ledger saved to: {evidence_path}")
-            except Exception as e:
-                print(f"[WARN] Failed to save evidence ledger: {e}")
-
-        claim_path = safe_resolve_under(self.base_result_dir, "claim_ledger.json")
-        try:
-            with open(claim_path, "w", encoding="utf-8") as f:
-                json.dump(
-                    {
-                        "metadata": {"query_id": self.query_id, "seed": self.seed},
-                        **self.claim_ledger,
-                    },
-                    f,
-                    indent=2,
-                    ensure_ascii=False,
-                )
-            print(f"[INFO] Claim ledger saved to: {claim_path}")
-        except Exception as e:
-            print(f"[WARN] Failed to save claim ledger: {e}")
-
-        if self.tool_results:
-            tool_path = safe_resolve_under(self.base_result_dir, "tool_results.json")
-            try:
-                with open(tool_path, "w", encoding="utf-8") as f:
-                    json.dump([result.to_dict() for result in self.tool_results], f, indent=2, ensure_ascii=False)
-                print(f"[INFO] Tool results saved to: {tool_path}")
-            except Exception as e:
-                print(f"[WARN] Failed to save tool results: {e}")
-
-        if self.agent_trace:
-            trace_path = safe_resolve_under(self.base_result_dir, "agent_trace.json")
-            try:
-                with open(trace_path, "w", encoding="utf-8") as f:
-                    json.dump(self.agent_trace, f, indent=2, ensure_ascii=False)
-                print(f"[INFO] Agent trace saved to: {trace_path}")
-            except Exception as e:
-                print(f"[WARN] Failed to save agent trace: {e}")
-        
         return aggregate_results(
             self.query_id,
             self.enhanced_query,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import asdict, dataclass, field
 from typing import Iterable, Mapping, Sequence
 
@@ -86,6 +87,57 @@ def novelty_against(query: str, selected_queries: Iterable[str]) -> float:
     return max(0.0, 1.0 - max(similarities))
 
 
+def blend_relevance(root_relevance: float, parent_relevance: float | None, parent_weight: float) -> float:
+    """Blend similarity-to-root with similarity-to-parent for a child branch.
+
+    Root-only relevance systematically under-scores deeper branches: a question
+    about a specific mechanism is further from the root query than a paraphrase
+    of the root, so the relative-cutoff pruner discards precisely the specific
+    sub-questions a deep search was spawned to answer.
+    """
+    if not 0.0 <= parent_weight <= 1.0:
+        raise ValueError("parent_weight must be between 0 and 1")
+    if parent_relevance is None or parent_weight == 0.0:
+        return float(root_relevance)
+    return ((1.0 - parent_weight) * float(root_relevance)) + (parent_weight * float(parent_relevance))
+
+
+_LEADING_NUMBER_PATTERN = re.compile(r"^\d+(?:[.,]\d+)*")
+# Markdown emphasis and code marks wrap quantities in extracted page text
+# ("**3 billion active**"), so they are stripped alongside ordinary punctuation.
+_STRIP_CHARS = "([{<\"'“‘$~≈±*_`#.,;:!?)]}>”’"
+
+
+def _numeric_tokens(text: str) -> list[str]:
+    """Quantities in `text`, normalized so 1,024 and 1024 compare equal.
+
+    Only words that *begin* with a digit count. Model names and identifiers carry
+    digits that are not quantities -- `OLMoE-1B-7B` is not a claim about 1 and 7,
+    and treating it as one rejected a faithful claim whose quote said exactly the
+    same thing. A word starting with a letter is an identifier; `3x`, `70B`,
+    `2.1`, `16` are quantities.
+    """
+    numbers = []
+    for word in (text or "").split():
+        stripped = word.strip(_STRIP_CHARS)
+        match = _LEADING_NUMBER_PATTERN.match(stripped)
+        if match:
+            numbers.append(match.group(0).replace(",", "").rstrip("."))
+    return numbers
+
+
+def numbers_supported_by_quote(claim_text: str, quote: str) -> bool:
+    """True when every number in the claim also appears in its quote.
+
+    Span verification proves a quote was copied, not that the claim built on it
+    is faithful. Fabricated or drifted figures ("up to 3x in some configs" ->
+    "3x faster") are the failure mode that most damages a research report, and
+    they are catchable without another model call.
+    """
+    quote_numbers = set(_numeric_tokens(quote))
+    return all(number in quote_numbers for number in _numeric_tokens(claim_text))
+
+
 def branch_priority(relevance: float, novelty: float, depth: int, *, relevance_weight: float = 0.72) -> float:
     """Score branches so relevant, novel, shallower work is explored first."""
     novelty_weight = 1.0 - relevance_weight
@@ -141,6 +193,31 @@ def mmr_rerank(candidates: Sequence[tuple[str, float]], *, lambda_relevance: flo
     return selected
 
 
+# Em/en dashes terminate a URL: markdown prose runs them straight onto the last
+# character ("…/2607.15105—far more than…"), and they are never URL characters.
+_URL_PATTERN = re.compile(r"https?://[^\s<>\"'\]\)\u2014\u2013]+")
+_URL_TRAILING = ".,;:!?)*\u2014\u2013'\""
+
+
+def audit_citations(report_text: str, ledger_urls: Iterable[str]) -> dict:
+    """Report which URLs a generated report cited, and which are not sources.
+
+    A page's own outbound links live in its extracted text, so a report can cite a
+    real, reachable URL that was never fetched or verified. That is a misattribution
+    the ledgers cannot otherwise show, so it is measured rather than assumed absent.
+    """
+    ledger = {url for url in ledger_urls if url}
+    cited = {match.group(0).rstrip(_URL_TRAILING) for match in _URL_PATTERN.finditer(report_text or "")}
+    inside = sorted(cited & ledger)
+    outside = sorted(cited - ledger)
+    return {
+        "cited_total": len(cited),
+        "cited_from_ledger": inside,
+        "cited_outside_ledger": outside,
+        "ledger_urls_uncited": sorted(ledger - cited),
+    }
+
+
 def make_evidence_item(page: dict, meta: dict, branch_query: str, snippet: str) -> EvidenceItem:
     url = page.get("url", "")
     file_path = page.get("file_path", "")
@@ -184,6 +261,9 @@ def verify_claims(
         located = locate_quote(text, str(claim["quote"]))
         if located is None:
             rejected.append({"claim": claim, "kept": False, "rejection_reason": "quote_not_found"})
+            continue
+        if not numbers_supported_by_quote(str(claim["claim_text"]), str(claim["quote"])):
+            rejected.append({"claim": claim, "kept": False, "rejection_reason": "numbers_not_in_quote"})
             continue
         start, end = located
         claim["char_start"] = start

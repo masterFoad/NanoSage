@@ -2,9 +2,11 @@
 
 import argparse
 import asyncio
+import sys
 import yaml
 import os
 
+from llm_interface import LLMGenerationError
 from search_session import SearchSession
 
 def load_config(config_path):
@@ -90,7 +92,16 @@ def main():
         llm_model=llm_model
     )
 
-    final_answer = asyncio.run(session.run_session())
+    try:
+        final_answer = asyncio.run(session.run_session())
+    except LLMGenerationError as exc:
+        # The branch tree, evidence and verified claims are the expensive part of
+        # a run; keep them for a retry. Writing the failure text as the report
+        # made a dead run look like a finished one, down to the zero exit code.
+        session.save_diagnostics()
+        print(f"[ERROR] Final report generation failed: {exc}")
+        print("[ERROR] Ledgers were saved; no report was written. Raise llm.timeout and re-run.")
+        sys.exit(1)
 
     # Save final report
     output_path = session.save_report(final_answer)

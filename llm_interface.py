@@ -8,6 +8,17 @@ import json
 from abc import ABC, abstractmethod
 from typing import Optional, Dict, Any
 
+class LLMGenerationError(RuntimeError):
+    """A provider call failed.
+
+    Providers used to swallow this and return the string ``Error generating
+    response: ...``. That string then flowed onward as if it were model output:
+    it was written to ``final_report.md`` as the report, and a failed branch
+    summary silently poisoned the evidence pool. Failures now propagate so a
+    caller can decide, per call site, whether to degrade or abort.
+    """
+
+
 DEFAULT_PROVIDER_MODELS = {
     "ollama": "gemma2:2b",
     "openai": "gpt-4o-mini",
@@ -34,6 +45,30 @@ def default_model_for_provider(provider: str, rag_model: str = "gemma") -> str:
     if provider_key == "litellm" and os.getenv("LITELLM_MODEL"):
         return os.environ["LITELLM_MODEL"]
     return DEFAULT_PROVIDER_MODELS.get(provider_key, DEFAULT_PROVIDER_MODELS["ollama"])
+
+
+def _summary_prompt(
+    text: str,
+    question: Optional[str] = None,
+    *,
+    part: Optional[tuple] = None,
+    combining: bool = False,
+) -> str:
+    """Build a summarization prompt, question-directed when a question is given."""
+    scope = ""
+    if part:
+        scope = f" This is part {part[0]} of {part[1]}; summarize only this part."
+    if combining:
+        scope = " These are partial summaries of one evidence set; combine them."
+    if not question:
+        return f"Please summarize the following text succinctly.{scope}\n\n{text}"
+    return (
+        f"Research question: {question}\n\n"
+        "Summarize the evidence below as an answer to that question. Lead with what the "
+        "evidence establishes about it, keep concrete figures, model names and conditions, "
+        "and say explicitly if the evidence does not address the question. Omit material "
+        f"that is irrelevant to it.{scope}\n\n{text}"
+    )
 
 
 class LLMProvider(ABC):
@@ -80,7 +115,7 @@ class OllamaProvider(LLMProvider):
             return response.message.content
         except Exception as e:
             print(f"[ERROR] Ollama generation failed: {e}")
-            return f"Error generating response: {e}"
+            raise LLMGenerationError(f"ollama generation failed: {e}") from e
     
     def get_provider_name(self) -> str:
         return f"ollama:{self.model}"
@@ -132,7 +167,7 @@ class OpenAIProvider(LLMProvider):
             return response.choices[0].message.content
         except Exception as e:
             print(f"[ERROR] OpenAI generation failed: {e}")
-            return f"Error generating response: {e}"
+            raise LLMGenerationError(f"openai generation failed: {e}") from e
     
     def get_provider_name(self) -> str:
         return f"openai:{self.model}"
@@ -185,7 +220,7 @@ class AnthropicProvider(LLMProvider):
             return response.content[0].text
         except Exception as e:
             print(f"[ERROR] Anthropic generation failed: {e}")
-            return f"Error generating response: {e}"
+            raise LLMGenerationError(f"anthropic generation failed: {e}") from e
     
     def get_provider_name(self) -> str:
         return f"anthropic:{self.model}"
@@ -244,27 +279,32 @@ class LLMManager:
         """Get information about the current provider."""
         return self.provider.get_provider_name()
     
-    def summarize_text(self, text: str, max_chars: int = 6000) -> str:
-        """Summarize text with automatic chunking for long content."""
+    def summarize_text(self, text: str, max_chars: int = 6000, question: Optional[str] = None) -> str:
+        """Summarize text, answering `question` when one is supplied.
+
+        Branch summaries are the highest-weighted evidence in the final report
+        prompt. A question-free "summarize this text" prompt produces a generic
+        page digest, so the report is assembled from material that never
+        addressed the branch's research question.
+        """
         if len(text) <= max_chars:
-            prompt = f"Please summarize the following text succinctly:\n\n{text}"
-            return self.generate(prompt)
-        
+            return self.generate(_summary_prompt(text, question))
+
         # If text is longer than max_chars, chunk it
         chunks = [text[i:i+max_chars] for i in range(0, len(text), max_chars)]
         summaries = []
-        
+
         for i, chunk in enumerate(chunks):
-            prompt = f"Summarize part {i+1}/{len(chunks)}:\n\n{chunk}"
+            prompt = _summary_prompt(chunk, question, part=(i + 1, len(chunks)))
             summary = self.generate(prompt)
             summaries.append(summary)
             time.sleep(1)  # Rate limiting
-        
+
         combined = "\n".join(summaries)
         if len(combined) > max_chars:
-            prompt = f"Combine these summaries into one concise summary:\n\n{combined}"
+            prompt = _summary_prompt(combined, question, combining=True)
             combined = self.generate(prompt)
-        
+
         return combined
     
     def enhance_query(self, query: str) -> str:
@@ -318,8 +358,6 @@ class LLMManager:
             },
         }
         raw = self.generate(prompt, system_message=system_message, response_format=response_format)
-        if raw.startswith("Error generating response:"):
-            raise ValueError(raw)
         parsed = json.loads(raw)
         if not isinstance(parsed, dict):
             raise ValueError("structured response was not a JSON object")

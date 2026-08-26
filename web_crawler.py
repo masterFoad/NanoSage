@@ -26,6 +26,7 @@ Notes / Ethics:
 from __future__ import annotations
 
 import os
+import re
 import json
 import hashlib
 import random
@@ -33,11 +34,13 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional, Tuple
+from html import escape as html_escape
 from urllib.parse import urlparse, quote_plus
 from urllib.robotparser import RobotFileParser
 from datetime import datetime
 
 import local_fetch
+import scholarly
 from canonical_text import persist_canonical_text
 
 # --- Third-party imports (soft-fail where possible) ---
@@ -315,6 +318,36 @@ class WikipediaEngine(BaseEngine):
         return results
 
 
+class ScholarlyEngine(BaseEngine):
+    """Keyless academic metadata search (OpenAlex + Europe PMC + arXiv).
+
+    Preferred over web engines for research queries: these APIs are not
+    bot-protected, and they return the abstract inline, so a result stays usable
+    as evidence even when its publisher page refuses to be fetched.
+    """
+
+    name = "scholarly"
+
+    async def search(self, keyword: str, *, max_results: int = 25) -> List[SearchResult]:
+        try:
+            records = await scholarly.search_scholarly(keyword, limit=max_results)
+        except Exception as exc:
+            logging.warning("scholarly search error: %s", exc)
+            return []
+        results: List[SearchResult] = []
+        for record in records:
+            if not record.url and not record.abstract:
+                continue
+            results.append(SearchResult(
+                title=record.title,
+                href=record.url,
+                body=record.abstract,
+                source=f"{self.name}:{record.source}",
+                published=str(record.year) if record.year else None,
+            ))
+        return results
+
+
 class LocalFetchEngine(BaseEngine):
     """Keyless search through an impersonated TLS session (see local_fetch)."""
 
@@ -399,6 +432,13 @@ def try_parse_date(text: str) -> Optional[datetime]:
         return None
 
 
+def _term_overlap(terms: List[str], text: str) -> float:
+    """Fraction of query terms present in ``text`` (0.0-1.0)."""
+    if not terms:
+        return 0.0
+    return sum(1 for term in terms if term in text) / len(terms)
+
+
 def score_result(item: SearchResult, keyword: str) -> float:
     href = item.href or ""
     title = (item.title or "").lower()
@@ -408,9 +448,14 @@ def score_result(item: SearchResult, keyword: str) -> float:
     is_good = any(host.endswith(d) for d in GOOD_DOMAINS)
     has_bad = any(h in href for h in BAD_HINTS)
 
+    # Token overlap, not substring containment. A multi-word query phrase never
+    # appears verbatim in a title, so `kw in title` scored every result 0.0 and
+    # left ranking entirely to domain reputation -- which handed biology queries
+    # to whichever reputable domain happened to be indexed, regardless of topic.
     kw = keyword.lower()
-    title_score = 2.0 if kw in title else 0.0
-    body_score = 1.0 if kw in body else 0.0
+    terms = [t for t in re.findall(r"[a-z0-9]{3,}", kw)]
+    title_score = 2.0 * _term_overlap(terms, title)
+    body_score = 1.0 * _term_overlap(terms, body)
     domain_score = 2.0 if is_good else 0.0
     penalty = -2.0 if has_bad else 0.0
 
@@ -664,7 +709,8 @@ class EngineManager:
 async def search_and_download(keyword: str, out_dir: str = "downloaded_webpages",
                               top_n: int = 20, concurrency: int = 12,
                               include_wikipedia: bool = False,
-                              browser_budget: Optional["local_fetch.BrowserBudget"] = None) -> List[Dict[str, Any]]:
+                              browser_budget: Optional["local_fetch.BrowserBudget"] = None,
+                              scholarly_search: bool = True) -> List[Dict[str, Any]]:
     engines: List[BaseEngine] = []
     
     # 1) Tavily first (most reliable, requires API key)
@@ -674,22 +720,27 @@ async def search_and_download(keyword: str, out_dir: str = "downloaded_webpages"
         except Exception as e:
             logging.warning("Tavily engine failed: %s", e)
     
-    # 2) Keyless local search. Preferred over the plain-HTTP engines below: it
+    # 2) Scholarly APIs first among the keyless engines: no bot protection, and
+    #    abstracts arrive inline so a blocked publisher page is not a dead end.
+    if scholarly_search:
+        engines.append(ScholarlyEngine())
+
+    # 3) Keyless local search. Preferred over the plain-HTTP engines below: it
     #    impersonates a real Chrome TLS fingerprint, so it is not blocked as often.
     if local_fetch.search_available():
         engines.append(LocalFetchEngine())
 
-    # 3) DDG fallback (fast, free)
+    # 4) DDG fallback (fast, free)
     if DDGS is not None:
         try:
             engines.append(DuckDuckGoEngine())
         except Exception:
             pass
 
-    # 4) SearxNG fallback (auto-discover a healthy instance)
+    # 5) SearxNG fallback (auto-discover a healthy instance)
     engines.append(SearxNGEngine())
     
-    # 5) Optional: Wikipedia for strong canonical pages
+    # 6) Optional: Wikipedia for strong canonical pages
     if include_wikipedia:
         engines.append(WikipediaEngine())
 
@@ -700,10 +751,14 @@ async def search_and_download(keyword: str, out_dir: str = "downloaded_webpages"
     urls = [r.href for r in ranked if r.href]
 
     pages = await download_many(urls, out_dir, concurrency=concurrency, browser_budget=browser_budget)
+    pages.extend(_pages_from_abstracts(ranked, pages, out_dir))
 
     # parse + sidecar metadata. Match by URL instead of zipping ranked/pages:
     # downloads can be skipped, and zip would misattribute source metadata.
     ranked_by_url = {r.href: r for r in ranked if r.href}
+    for r in ranked:
+        if not r.href:
+            ranked_by_url[f"{r.source}:{r.title}"] = r
     parsed = []
     for page in pages:
         r = ranked_by_url.get(page["url"])
@@ -748,6 +803,55 @@ async def search_and_download(keyword: str, out_dir: str = "downloaded_webpages"
         parsed.append({**page, "meta": sidecar})
 
     return parsed
+
+
+MIN_ABSTRACT_CHARS = 240
+
+
+def _pages_from_abstracts(ranked: List[SearchResult], pages: List[Dict[str, Any]],
+                          out_dir: str) -> List[Dict[str, Any]]:
+    """Turn abstracts of undownloadable results into first-class evidence.
+
+    Scholarly APIs hand back the abstract with the metadata, so a result whose
+    publisher page is paywalled or bot-protected still carries real, citable text.
+    Without this, the most authoritative sources are precisely the ones that
+    contribute nothing. The abstract is written as minimal HTML so it flows
+    through the same extraction, canonicalization, and chunking path as any
+    downloaded page -- no special-cased evidence type downstream.
+    """
+    downloaded = {page.get("url") for page in pages if page}
+    synthesized: List[Dict[str, Any]] = []
+    for result in ranked:
+        if result.href in downloaded:
+            continue
+        abstract = (result.body or "").strip()
+        if len(abstract) < MIN_ABSTRACT_CHARS:
+            continue
+        document = (
+            "<!doctype html><html><head><meta charset=\"utf-8\">"
+            f"<title>{html_escape(result.title)}</title></head><body>"
+            f"<h1>{html_escape(result.title)}</h1>"
+            f"<p>{html_escape(abstract)}</p>"
+            "</body></html>"
+        )
+        raw = document.encode("utf-8")
+        identity = result.href or f"{result.source}:{result.title}"
+        fpath = os.path.join(out_dir, f"{url_hash(identity)}.abstract.html")
+        try:
+            with open(fpath, "wb") as f:
+                f.write(raw)
+        except Exception as exc:
+            logging.warning("Could not persist abstract for %s: %s", result.title[:60], exc)
+            continue
+        logging.info("Using abstract as evidence for %s", result.title[:70])
+        synthesized.append({
+            "url": result.href or identity,
+            "file_path": fpath,
+            "content_type": "text/html",
+            "size": len(raw),
+            "fetch_tier": "abstract",
+        })
+    return synthesized
 
 
 # -------------------- CLI --------------------
