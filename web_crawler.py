@@ -426,7 +426,12 @@ class TavilyEngine(BaseEngine):
 
 # -------------------- Reranker & Deduper --------------------
 
-GOOD_DOMAINS = (".gov", ".edu", "arxiv.org", "acm.org", "ieee.org", "who.int", "un.org")
+# arxiv.org is deliberately absent: the scholarly engine returns 30 dated
+# arXiv records per query, and a +2 domain bonus on top of +1/+2 recency
+# outscored every on-topic web page for a Postgres question (measured
+# 2026-08-29: 11 of 15 sources were off-topic papers). Scholarly hits still
+# rank on title/body overlap like everything else.
+GOOD_DOMAINS = (".gov", ".edu", "acm.org", "ieee.org", "who.int", "un.org")
 BAD_HINTS = ("pinterest.", "quora.", "/tag/", "/category/")
 
 
