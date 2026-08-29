@@ -1,0 +1,25 @@
+{
+  "_comment": "Deliberately spans topic types. Every constant in NanoSage was tuned on one arXiv-rich English technical query; these exist to find out where that generalizes and where it does not. must_mention is a crude gross-failure check, not a grading key.",
+  "queries": [
+    {"name": "moe-vs-dense", "type": "technical", "query": "What are the practical tradeoffs between mixture-of-experts and dense transformer models for local LLM inference on consumer hardware?", "must_mention": ["VRAM", "experts"]},
+    {"name": "kv-cache-memory", "type": "narrow-technical", "query": "How is the memory footprint of a transformer KV cache calculated from layer count, head count, head dimension, and context length?", "must_mention": ["KV cache", "context"]},
+    {"name": "postgres-index-choice", "type": "technical", "query": "When should a Postgres table use a BRIN index instead of a B-tree index, and what are the tradeoffs?", "must_mention": ["BRIN", "B-tree"]},
+    {"name": "rust-async-runtimes", "type": "comparative", "query": "How do Tokio and async-std differ in scheduler design, and why did one become dominant?", "must_mention": ["Tokio"]},
+    {"name": "crispr-off-target", "type": "scientific", "query": "What methods are used to measure and reduce off-target effects in CRISPR-Cas9 genome editing?", "must_mention": ["off-target", "Cas9"]},
+    {"name": "antibiotic-resistance", "type": "scientific", "query": "What are the main molecular mechanisms by which bacteria acquire resistance to beta-lactam antibiotics?", "must_mention": ["beta-lactam"]},
+    {"name": "tardigrade-desiccation", "type": "scientific-narrow", "query": "Which molecular mechanisms allow tardigrades to survive complete desiccation, and how well established is each?", "must_mention": ["tardigrade"]},
+    {"name": "roman-concrete", "type": "historical", "query": "Why has Roman marine concrete survived two thousand years, and what did recent analysis reveal about its self-healing?", "must_mention": ["concrete"]},
+    {"name": "bronze-age-collapse", "type": "historical-contested", "query": "What explanations have been proposed for the Late Bronze Age collapse, and which are best supported by evidence?", "must_mention": ["Bronze Age"]},
+    {"name": "dutch-tulip-mania", "type": "historical-contested", "query": "Was Dutch tulip mania an actual economic bubble, and how have modern economic historians revised the popular account?", "must_mention": ["tulip"]},
+    {"name": "minimum-wage-employment", "type": "contested", "query": "What does the empirical economics literature currently conclude about minimum wage increases and employment levels?", "must_mention": ["minimum wage"]},
+    {"name": "nuclear-vs-renewables", "type": "contested", "query": "How do lifecycle carbon emissions and cost per megawatt-hour compare between nuclear power and utility-scale solar?", "must_mention": ["nuclear"]},
+    {"name": "sleep-and-memory", "type": "scientific-contested", "query": "How strong is the evidence that sleep consolidates declarative memory, and what are the main competing interpretations?", "must_mention": ["sleep", "memory"]},
+    {"name": "how-tls-handshake-works", "type": "how-it-works", "query": "How does the TLS 1.3 handshake establish a shared secret, and how does it differ from TLS 1.2?", "must_mention": ["TLS 1.3", "handshake"]},
+    {"name": "how-solid-state-batteries", "type": "how-it-works", "query": "How do solid-state lithium batteries work, and what specific problems block their mass production?", "must_mention": ["solid-state"]},
+    {"name": "quantum-error-correction", "type": "technical-recent", "query": "What progress has been made on quantum error correction below the surface code threshold?", "must_mention": ["error correction"]},
+    {"name": "webassembly-gc", "type": "technical-recent", "query": "What does the WebAssembly garbage collection proposal add, and which languages benefit from it?", "must_mention": ["WebAssembly"]},
+    {"name": "ocean-heat-content", "type": "recent-data", "query": "What do the most recent measurements say about ocean heat content trends, and how is it measured?", "must_mention": ["ocean heat"]},
+    {"name": "sqlite-wal-mode", "type": "narrow", "query": "What are the concurrency and durability implications of enabling SQLite WAL mode?", "must_mention": ["WAL"]},
+    {"name": "obscure-lang-apl", "type": "narrow-sparse", "query": "Why did APL's array programming model influence later languages despite APL itself remaining niche?", "must_mention": ["APL", "array"]}
+  ]
+}
