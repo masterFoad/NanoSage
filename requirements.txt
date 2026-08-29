@@ -7,7 +7,7 @@ pyyaml
 
 # Web and Parsing
 aiohttp
-duckduckgo-search
+ddgs                 # successor of duckduckgo-search; the old package returns 0 results as of 2026-08
 beautifulsoup4
 trafilatura
 readability-lxml

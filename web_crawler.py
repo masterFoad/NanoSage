@@ -45,9 +45,15 @@ from canonical_text import persist_canonical_text
 
 # --- Third-party imports (soft-fail where possible) ---
 try:
-    from duckduckgo_search import DDGS  # free text/news/images search
+    from ddgs import DDGS  # free text search; successor of duckduckgo-search
 except Exception:  # pragma: no cover
-    DDGS = None
+    try:
+        # The old package still imports but returned 0 results for every query
+        # as of 2026-08; kept only so an un-upgraded environment degrades loudly
+        # (see the per-engine count log in EngineManager) rather than crashing.
+        from duckduckgo_search import DDGS
+    except Exception:
+        DDGS = None
 
 try:
     import aiohttp
@@ -696,6 +702,10 @@ class EngineManager:
             except Exception as e:
                 logging.warning("engine %s error: %s", eng.name, e)
                 chunk = []
+            # A dead engine returning [] is otherwise invisible: the run silently
+            # continues on whatever the remaining engines find (measured: a full
+            # run on arXiv abstracts alone after duckduckgo-search stopped working).
+            print(f"[INFO] engine {eng.name}: {len(chunk)} result(s) for '{keyword[:60]}'")
             if chunk:
                 aggregate.extend(chunk)
             # If we already have a reasonable set, we can stop early
