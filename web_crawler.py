@@ -426,12 +426,7 @@ class TavilyEngine(BaseEngine):
 
 # -------------------- Reranker & Deduper --------------------
 
-# arxiv.org is deliberately absent: the scholarly engine returns 30 dated
-# arXiv records per query, and a +2 domain bonus on top of +1/+2 recency
-# outscored every on-topic web page for a Postgres question (measured
-# 2026-08-29: 11 of 15 sources were off-topic papers). Scholarly hits still
-# rank on title/body overlap like everything else.
-GOOD_DOMAINS = (".gov", ".edu", "acm.org", "ieee.org", "who.int", "un.org")
+GOOD_DOMAINS = (".gov", ".edu", "arxiv.org", "acm.org", "ieee.org", "who.int", "un.org")
 BAD_HINTS = ("pinterest.", "quora.", "/tag/", "/category/")
 
 
@@ -467,7 +462,13 @@ def score_result(item: SearchResult, keyword: str) -> float:
     terms = [t for t in re.findall(r"[a-z0-9]{3,}", kw)]
     title_score = 2.0 * _term_overlap(terms, title)
     body_score = 1.0 * _term_overlap(terms, body)
-    domain_score = 2.0 if is_good else 0.0
+    # Reputation only counts for a result that is about the query. A flat +2
+    # let 30 dated arXiv records per query outrank every on-topic web page on
+    # a Postgres question (11 of 15 sources were off-topic papers), while
+    # removing the bonus halved the evidence on an ML query where arXiv was
+    # the right source (18 -> 7 claims, reproducible). Measured 2026-08-29.
+    topic_overlap = max(_term_overlap(terms, title), _term_overlap(terms, body))
+    domain_score = 2.0 * topic_overlap if is_good else 0.0
     penalty = -2.0 if has_bad else 0.0
 
     # recency heuristic
