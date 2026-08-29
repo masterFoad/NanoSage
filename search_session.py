@@ -359,7 +359,10 @@ class SearchSession:
 
         # Enhance the query via chain-of-thought.
         self.enhanced_query = self.llm_manager.enhance_query(self.query)
-        if not self.enhanced_query:
+        # Every downstream prompt sees only the enhanced query, so a truncated
+        # or garbled enhancement sends the whole run after a hallucinated topic.
+        if len((self.enhanced_query or "").strip()) < 20:
+            print(f"[WARN] Query enhancement returned {self.enhanced_query!r}; using the original query.")
             self.enhanced_query = self.query
 
         # Load retrieval only when the run can actually use it. This keeps
@@ -591,7 +594,7 @@ class SearchSession:
         grouped = group_blocks_for_coverage(
             blocks,
             int(self.config.get("claim_extraction_char_budget", 8000)),
-            int(self.config.get("max_claim_extraction_calls_per_branch", 4)),
+            int(self.config.get("max_claim_extraction_calls_per_branch", 2)),
         )
         return [
             [f"{block.label}\n{block.text}" for block in group]

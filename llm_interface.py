@@ -326,10 +326,19 @@ class LLMManager:
     def _extract_final_query(self, text: str) -> str:
         """Extract the final enhanced query from the response."""
 
-        lines = text.split('\n')
-        for line in lines:
-            if 'Final Enhanced Query:' in line:
-                return line.split('Final Enhanced Query:')[-1].strip()
+        # Models often emit a bold "**Final Enhanced Query:**" heading before the
+        # actual line, so the first match can be empty; take the last non-empty
+        # one and strip markdown emphasis. Measured 2026-08-29: the first-match
+        # version returned "**", and the whole run researched a hallucinated topic.
+        marker = 'Final Enhanced Query:'
+        candidates = []
+        for line in text.split('\n'):
+            if marker in line:
+                candidate = line.split(marker)[-1].strip().strip('*').strip()
+                if candidate:
+                    candidates.append(candidate)
+        if candidates:
+            return candidates[-1]
         return text.strip()
     
     def generate_final_answer(self, aggregation_prompt: str) -> str:
