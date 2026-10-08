@@ -41,6 +41,7 @@ from datetime import datetime
 
 import local_fetch
 import scholarly
+import youcom_search
 from canonical_text import persist_canonical_text
 
 # --- Third-party imports (soft-fail where possible) ---
@@ -373,6 +374,37 @@ class LocalFetchEngine(BaseEngine):
             if hit.url
         ]
 
+
+
+class YouComEngine(BaseEngine):
+    """Keyless hosted web search via the You.com MCP free profile.
+
+    Opt-in: appended only when search_and_download(youcom_search=True). No API
+    key needed for the free profile; YOUCOM_API_KEY switches to the
+    authenticated profile (see youcom_search.py). A hosted, keyless API is
+    steadier than scraping public instances, so it slots in before the
+    plain-HTTP fallback engines — but the default chain is otherwise untouched.
+    """
+
+    name = "youcom"
+
+    async def search(self, keyword: str, *, max_results: int = 25) -> List[SearchResult]:
+        try:
+            records = await youcom_search.search_youcom(keyword, limit=max_results)
+        except Exception as exc:
+            logging.warning("You.com search error: %s", exc)
+            return []
+        results: List[SearchResult] = []
+        for record in records:
+            if not record.url:
+                continue
+            results.append(SearchResult(
+                title=record.title,
+                href=record.url,
+                body=record.description,
+                source=self.name,
+            ))
+        return results[:max_results]
 
 
 class TavilyEngine(BaseEngine):
@@ -726,7 +758,8 @@ async def search_and_download(keyword: str, out_dir: str = "downloaded_webpages"
                               top_n: int = 20, concurrency: int = 12,
                               include_wikipedia: bool = False,
                               browser_budget: Optional["local_fetch.BrowserBudget"] = None,
-                              scholarly_search: bool = True) -> List[Dict[str, Any]]:
+                              scholarly_search: bool = True,
+                              youcom_search: bool = False) -> List[Dict[str, Any]]:
     engines: List[BaseEngine] = []
     
     # 1) Tavily first (most reliable, requires API key)
@@ -753,10 +786,14 @@ async def search_and_download(keyword: str, out_dir: str = "downloaded_webpages"
         except Exception:
             pass
 
-    # 5) SearxNG fallback (auto-discover a healthy instance)
+    # 5) You.com hosted search (optional; keyless MCP free profile — no API key)
+    if youcom_search:
+        engines.append(YouComEngine())
+
+    # 6) SearxNG fallback (auto-discover a healthy instance)
     engines.append(SearxNGEngine())
     
-    # 6) Optional: Wikipedia for strong canonical pages
+    # 7) Optional: Wikipedia for strong canonical pages
     if include_wikipedia:
         engines.append(WikipediaEngine())
 

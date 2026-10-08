@@ -9,7 +9,8 @@ brief you were given, it does not apply here.
 ## What this project is
 
 A local-first recursive research agent: enhance a query, derive subqueries, search the web
-(Tavily → DuckDuckGo → SearxNG → Wikipedia), download and extract page text, embed it, explore a
+(Tavily → DuckDuckGo → SearxNG → Wikipedia; `youcom_search: true` adds an optional keyless
+You.com hosted engine), download and extract page text, embed it, explore a
 scored branch frontier, summarize each branch with an LLM, and emit a Markdown report plus a
 TOC/analytics JSON.
 

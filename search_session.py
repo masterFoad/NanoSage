@@ -942,6 +942,7 @@ class SearchSession:
                 include_wikipedia=self.config.get("include_wikipedia", False),
                 browser_budget=self.browser_budget,
                 scholarly_search=bool(self.config.get("scholarly_search", True)),
+                youcom_search=bool(self.config.get("youcom_search", False)),
             )
 
             web_search_end = time.time()
