@@ -10,6 +10,7 @@ web_search_limit: 5
 web_concurrency: 8
 include_wikipedia: false
 scholarly_search: true       # Keyless OpenAlex/Europe PMC/arXiv metadata search.
+youcom_search: false         # Optional keyless You.com hosted web search (MCP free profile; no API key).
 browser_escalation_limit: 0    # Max real-browser page renders per run (needs nodriver). 0 disables.
 max_depth: 1
 max_query_length: 200

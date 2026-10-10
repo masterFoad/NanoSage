@@ -52,6 +52,7 @@ def main():
     parser.add_argument("--llm_model", type=str, default=None, help="Specific LLM model to use (overrides provider default)")
     parser.add_argument("--web_concurrency", type=int, default=None, help="Concurrent web downloads")
     parser.add_argument("--include_wikipedia", action="store_true", default=None, help="Include Wikipedia in web search")
+    parser.add_argument("--youcom_search", action="store_true", default=None, help="Include keyless You.com hosted search (MCP free profile)")
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -66,6 +67,7 @@ def main():
     web_search_enabled = bool(_cfg(config, "web_search", args.web_search, False))
     web_concurrency = _positive_int("web_concurrency", _cfg(config, "web_concurrency", args.web_concurrency, 8))
     include_wikipedia = bool(_cfg(config, "include_wikipedia", args.include_wikipedia, False))
+    youcom_search = bool(_cfg(config, "youcom_search", args.youcom_search, False))
     llm_provider = _cfg(llm_config, "provider", args.llm_provider, "ollama")
     llm_model = _cfg(llm_config, "model", args.llm_model, None)
     rag_model = _cfg(config, "rag_model", args.rag_model, "gemma")
@@ -75,6 +77,7 @@ def main():
         "web_concurrency": web_concurrency,
         "include_wikipedia": include_wikipedia,
         "web_search": web_search_enabled,
+        "youcom_search": youcom_search,
     })
 
     session = SearchSession(

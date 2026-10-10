@@ -303,6 +303,11 @@ This approach makes dimension mismatches explicit and uses the right tool for ea
 - **Fallback**: DuckDuckGo, SearxNG, Wikipedia
 - **Sources**: PubMed, academic journals, research databases
 - **Features**: Real-time search, content extraction, metadata generation
+- **Optional**: You.com hosted search (keyless MCP free profile) — enable with
+  `--youcom_search` or `youcom_search: true` in `config.yaml`. No API key is
+  required; set `YOUCOM_API_KEY` in `.env` only if you want the authenticated
+  profile. Like the other engines, it is fail-open: on error it logs a warning
+  and the remaining engines still run.
 
 ---
 
