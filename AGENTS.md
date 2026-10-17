@@ -10,7 +10,7 @@ brief you were given, it does not apply here.
 
 A local-first recursive research agent: enhance a query, derive subqueries, search the web
 (Tavily → DuckDuckGo → SearxNG → Wikipedia; `youcom_search: true` adds an optional keyless
-You.com hosted engine), download and extract page text, embed it, explore a
+You.com hosted engine, and `SERPLY_API_KEY` adds Serply Google results after Tavily), download and extract page text, embed it, explore a
 scored branch frontier, summarize each branch with an LLM, and emit a Markdown report plus a
 TOC/analytics JSON.
 
