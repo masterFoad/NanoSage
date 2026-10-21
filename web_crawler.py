@@ -489,9 +489,16 @@ class SerplyEngine(BaseEngine):
         except Exception as e:
             logging.warning("Serply search error: %s", e)
             return []
-        for item in data.get("results") or []:
-            link = item.get("link") or ""
-            if not link.startswith("http"):
+        # A 200 with a non-object body (or junk entries) must not crash the engine.
+        items = data.get("results") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            logging.warning("Serply search: unexpected response body")
+            return []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            link = item.get("link")
+            if not isinstance(link, str) or not link.startswith("http"):
                 continue
             results.append(SearchResult(
                 title=item.get("title", ""),

@@ -91,6 +91,15 @@ class SerplyEngineTests(unittest.TestCase):
     def test_http_error_returns_empty(self):
         self.assertEqual(self._search(fake_session({"error": "quota"}, status=402)), [])
 
+    def test_unexpected_body_returns_empty(self):
+        for payload in ([], "oops", None, {"results": "nope"}):
+            with self.subTest(payload=payload):
+                self.assertEqual(self._search(fake_session(payload)), [])
+
+    def test_skips_malformed_entries(self):
+        payload = {"results": ["junk", {"link": None}, {"title": "A", "link": "https://example.test/a"}]}
+        self.assertEqual([r.href for r in self._search(fake_session(payload))], ["https://example.test/a"])
+
 
 class SearchAndDownloadWiringTests(unittest.TestCase):
     def test_engine_added_only_with_key(self):
