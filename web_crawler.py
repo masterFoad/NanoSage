@@ -456,6 +456,53 @@ class TavilyEngine(BaseEngine):
         return results
 
 
+
+class SerplyEngine(BaseEngine):
+    """Google results via the Serply API (https://serply.io).
+
+    Opt-in: appended only when SERPLY_API_KEY is set, like Tavily. Serply
+    returns at most 10 results per request.
+    """
+
+    name = "serply"
+    endpoint = "https://api.serply.io/v1/search/"
+
+    def __init__(self, timeout: int = 30):
+        self.api_key = os.getenv("SERPLY_API_KEY")
+        if not self.api_key:
+            raise RuntimeError("SERPLY_API_KEY environment variable not set")
+        # Uncached queries can take ~15s, so this is looser than the other engines.
+        self.timeout = timeout
+
+    async def search(self, keyword: str, *, max_results: int = 25) -> List[SearchResult]:
+        params = {"q": keyword, "num": min(max_results, 10)}
+        headers = {"X-Api-Key": self.api_key, "Accept": "application/json", "User-Agent": "NanoSage"}
+        timeout = aiohttp.ClientTimeout(total=self.timeout)
+        results: List[SearchResult] = []
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                async with session.get(self.endpoint, params=params) as resp:
+                    if resp.status != 200:
+                        logging.warning("Serply search HTTP %s", resp.status)
+                        return []
+                    data = await resp.json()
+        except Exception as e:
+            logging.warning("Serply search error: %s", e)
+            return []
+        for item in data.get("results") or []:
+            link = item.get("link") or ""
+            if not link.startswith("http"):
+                continue
+            results.append(SearchResult(
+                title=item.get("title", ""),
+                href=link,
+                body=item.get("description", ""),
+                source=self.name,
+            ))
+            if len(results) >= max_results:
+                break
+        return results
+
 # -------------------- Reranker & Deduper --------------------
 
 GOOD_DOMAINS = (".gov", ".edu", "arxiv.org", "acm.org", "ieee.org", "who.int", "un.org")
@@ -768,6 +815,10 @@ async def search_and_download(keyword: str, out_dir: str = "downloaded_webpages"
             engines.append(TavilyEngine())
         except Exception as e:
             logging.warning("Tavily engine failed: %s", e)
+
+    # 1b) Serply (Google results, requires API key)
+    if os.getenv("SERPLY_API_KEY"):
+        engines.append(SerplyEngine())
     
     # 2) Scholarly APIs first among the keyless engines: no bot protection, and
     #    abstracts arrive inline so a blocked publisher page is not a dead end.
