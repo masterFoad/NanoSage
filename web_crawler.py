@@ -510,6 +510,61 @@ class SerplyEngine(BaseEngine):
                 break
         return results
 
+
+class SearchApiEngine(BaseEngine):
+    """Google results via SearchApi (https://www.searchapi.io).
+
+    Opt-in: appended only when SEARCHAPI_API_KEY is set, like Serply. Google
+    serves 10 organic results per page; one request costs one credit, so this
+    does not paginate.
+    """
+
+    name = "searchapi"
+    endpoint = "https://www.searchapi.io/api/v1/search"
+
+    def __init__(self, timeout: int = 30):
+        self.api_key = os.getenv("SEARCHAPI_API_KEY")
+        if not self.api_key:
+            raise RuntimeError("SEARCHAPI_API_KEY environment variable not set")
+        self.timeout = timeout
+
+    async def search(self, keyword: str, *, max_results: int = 25) -> List[SearchResult]:
+        params = {"engine": "google", "q": keyword}
+        # Bearer header rather than ?api_key= so the key stays out of URLs and logs.
+        headers = {"Authorization": f"Bearer {self.api_key}", "Accept": "application/json",
+                   "User-Agent": "NanoSage"}
+        timeout = aiohttp.ClientTimeout(total=self.timeout)
+        results: List[SearchResult] = []
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                async with session.get(self.endpoint, params=params) as resp:
+                    if resp.status != 200:
+                        logging.warning("SearchApi search HTTP %s", resp.status)
+                        return []
+                    data = await resp.json()
+        except Exception as e:
+            logging.warning("SearchApi search error: %s", e)
+            return []
+        items = data.get("organic_results") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            logging.warning("SearchApi search: unexpected response body")
+            return []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            link = item.get("link")
+            if not isinstance(link, str) or not link.startswith("http"):
+                continue
+            results.append(SearchResult(
+                title=item.get("title", ""),
+                href=link,
+                body=item.get("snippet", ""),
+                source=self.name,
+            ))
+            if len(results) >= max_results:
+                break
+        return results
+
 # -------------------- Reranker & Deduper --------------------
 
 GOOD_DOMAINS = (".gov", ".edu", "arxiv.org", "acm.org", "ieee.org", "who.int", "un.org")
@@ -828,7 +883,11 @@ async def search_and_download(keyword: str, out_dir: str = "downloaded_webpages"
     # 1b) Serply (Google results, requires API key)
     if os.getenv("SERPLY_API_KEY"):
         engines.append(SerplyEngine())
-    
+
+    # 1c) SearchApi (Google results, requires API key)
+    if os.getenv("SEARCHAPI_API_KEY"):
+        engines.append(SearchApiEngine())
+
     # 2) Scholarly APIs first among the keyless engines: no bot protection, and
     #    abstracts arrive inline so a blocked publisher page is not a dead end.
     if scholarly_search:

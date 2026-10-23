@@ -308,6 +308,8 @@ This approach makes dimension mismatches explicit and uses the right tool for ea
   required; set `YOUCOM_API_KEY` in `.env` only if you want the authenticated
   profile. Like the other engines, it is fail-open: on error it logs a warning
   and the remaining engines still run.
+- **Optional**: Google results via [SearchApi](https://www.searchapi.io/?utm_source=github&utm_medium=sponsorship&utm_campaign=google_search_api&utm_content=masterFoad_NanoSage) - set
+  `SEARCHAPI_API_KEY` in `.env` to enable. Fail-open like the other engines.
 
 ---
 
