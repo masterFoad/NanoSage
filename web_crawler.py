@@ -37,7 +37,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from html import escape as html_escape
 from urllib.parse import urlparse, quote_plus
 from urllib.robotparser import RobotFileParser
-from datetime import datetime
+from datetime import datetime, timezone
 
 import local_fetch
 import scholarly
@@ -565,6 +565,8 @@ def score_result(item: SearchResult, keyword: str) -> float:
         dt = try_parse_date(body) or try_parse_date(title)
     recency = 0.0
     if dt:
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
         days = max(1, (datetime.utcnow() - dt).days)
         if days < 30:
             recency = 2.0

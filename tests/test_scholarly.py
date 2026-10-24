@@ -110,6 +110,13 @@ class ResultScoringTests(unittest.TestCase):
         # Term overlap must still put the on-topic paper ahead of it.
         self.assertGreater(score_result(on_topic, query), score_result(off_topic, query))
 
+    def test_timezone_aware_published_date_does_not_crash(self):
+        from web_crawler import SearchResult, score_result
+
+        result = SearchResult(title="BRIN indexes", href="https://example.org/brin",
+                              body="BRIN", published="2024-03-01T12:00:00+00:00")
+        self.assertIsInstance(score_result(result, "BRIN indexes"), float)
+
     def test_term_overlap_is_fractional(self):
         from web_crawler import _term_overlap
 
