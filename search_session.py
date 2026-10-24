@@ -26,6 +26,8 @@ from evidence import (
     mmr_rerank,
     novelty_against,
     refresh_search_branch,
+    remove_off_ledger_citations,
+    source_kind,
     stable_id,
     verify_claims,
 )
@@ -821,6 +823,21 @@ class SearchSession:
             kept_index_set.add(index)
         if forced:
             print(f"[WARN] All branch sources fell below cutoff {cutoff:.3f}; keeping the top {len(kept_index_set)}.")
+        # Papers get a wider margin. The cut is relative to the branch's best page,
+        # which is usually a popular article worded like the question; abstracts
+        # use technical vocabulary and land just under it (0.50-0.55 against
+        # cutoffs of 0.54-0.61 on one run, all on-topic Roman-concrete papers).
+        # Only the margin widens -- an absolute floor still applies to everyone.
+        scholarly_margin = self.config.get("scholarly_relevance_margin", 0.25)
+        if scholarly_margin is not None and margin > 0 and float(scholarly_margin) > margin:
+            best = max(candidate["relevance"] for candidate in page_candidates)
+            scholarly_cutoff = best - float(scholarly_margin)
+            if floor:
+                scholarly_cutoff = max(scholarly_cutoff, float(floor))
+            for index, candidate in enumerate(page_candidates):
+                engine = str(candidate.get("web_result", {}).get("source_engine", ""))
+                if engine.startswith("scholarly") and candidate["relevance"] >= scholarly_cutoff:
+                    kept_index_set.add(index)
         kept = [candidate for index, candidate in enumerate(page_candidates) if index in kept_index_set]
         dropped = [candidate for index, candidate in enumerate(page_candidates) if index not in kept_index_set]
         return kept, dropped, cutoff
@@ -1239,12 +1256,16 @@ class SearchSession:
         # mapping between them in the same prompt, the report is asked to cite
         # sources it has no way to attribute, so the URL travels with the claim.
         url_by_evidence_id = {item.evidence_id: item.url for item in self.evidence_items}
+        kind_by_evidence_id = {
+            item.evidence_id: source_kind(item.url, item.source_engine) for item in self.evidence_items
+        }
         for record in self.claim_ledger.get("kept", []):
             claim = record.get("claim", {})
             evidence_id = claim.get("evidence_id", "")
             source_url = url_by_evidence_id.get(evidence_id, "")
+            kind = kind_by_evidence_id.get(evidence_id, "web page")
             blocks.append(EvidenceTextBlock(
-                f"Verified Claim [{evidence_id}] source {source_url or 'unknown'} offsets "
+                f"Verified Claim [{evidence_id}] source {source_url or 'unknown'} ({kind}) offsets "
                 f"{claim.get('char_start', 0)}-{claim.get('char_end', 0)}:",
                 f"{claim.get('claim_text', '')}\nExact quote: {claim.get('quote', '')}",
                 90.0,
@@ -1273,12 +1294,19 @@ class SearchSession:
 
         evidence_budget = int(self.config.get("final_report_char_budget", 20000))
         stable_instructions = (
-            "You are an expert research analyst. Produce a comprehensive, advanced Markdown report "
-            "of at least 3000 words using only the supplied NanoSage evidence.\n"
-            "The report should include a detailed table of contents, multiple sections, in-depth "
-            "analysis with citations, and a final reference section listing relevant URLs.\n"
-            "Cover background, current findings, challenges, and future directions. Use section "
-            "headings and subheadings. Do not invent evidence or citations.\n"
+            "You are a research analyst writing for a technically literate reader. Produce a "
+            "thorough Markdown report of roughly 2000-4000 words using only the supplied NanoSage "
+            "evidence; let the evidence set the length rather than padding.\n"
+            "Include a short table of contents, an executive summary, sections covering background, "
+            "current findings, open questions, and future directions, and a final reference "
+            "section listing the URLs you cited. Do not invent evidence or citations.\n"
+            "Headings are short and plain: they say what the section is about in everyday words "
+            "(\"How the cracks heal\", not \"Dynamic Autogenous Remediation Pathways\"). Explain "
+            "technical terms the first time they appear rather than stacking them.\n"
+            "Each Verified Claim line names its source type. When a paper and a web page support "
+            "the same point, cite the paper. Vendor, marketing, and aggregator pages are weak "
+            "support: never let one be the only citation for a central scientific claim without "
+            "saying so.\n"
             "Cite every claim with the source URL given on its own Verified Claim line, or a URL "
             "from the Reference URL list. Those are the only citable sources: a URL that merely "
             "appears inside a page's text is that page's own outbound link and must never be "
@@ -1297,7 +1325,12 @@ class SearchSession:
         self.citation_audit = audit_citations(final_answer, url_by_evidence_id.values())
         off_ledger = self.citation_audit["cited_outside_ledger"]
         if off_ledger:
-            print(f"[WARN] Report cited {len(off_ledger)} URL(s) that are not fetched sources: {', '.join(off_ledger[:3])}")
+            print(f"[WARN] Report cited {len(off_ledger)} URL(s) that are not fetched sources; removing: {', '.join(off_ledger[:3])}")
+            final_answer = remove_off_ledger_citations(final_answer, off_ledger)
+            self.citation_audit["removed_from_report"] = off_ledger
+            self.citation_audit["remaining_outside_ledger"] = audit_citations(
+                final_answer, url_by_evidence_id.values()
+            )["cited_outside_ledger"]
         return final_answer
 
     def save_report(self, final_answer, previous_results=None, follow_up_convo=None):

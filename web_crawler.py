@@ -864,7 +864,6 @@ async def search_and_download(keyword: str, out_dir: str = "downloaded_webpages"
     urls = [r.href for r in ranked if r.href]
 
     pages = await download_many(urls, out_dir, concurrency=concurrency, browser_budget=browser_budget)
-    pages.extend(_pages_from_abstracts(ranked, pages, out_dir))
 
     # parse + sidecar metadata. Match by URL instead of zipping ranked/pages:
     # downloads can be skipped, and zip would misattribute source metadata.
@@ -872,50 +871,68 @@ async def search_and_download(keyword: str, out_dir: str = "downloaded_webpages"
     for r in ranked:
         if not r.href:
             ranked_by_url[f"{r.source}:{r.title}"] = r
-    parsed = []
-    for page in pages:
-        r = ranked_by_url.get(page["url"])
-        if r is None:
-            logging.warning("Downloaded page has no ranked metadata match: %s", page["url"])
-            continue
-        extracted = parse_any_to_text(page["file_path"]) or ""
-        if local_fetch.is_challenge_text(extracted):
-            # "Checking your browser..." extracts to real characters, so the usual
-            # empty-text guard lets it through and it becomes a cited source.
-            logging.info("Discarding challenge/interstitial page: %s", page["url"])
-            continue
-        try:
-            artifact = persist_canonical_text(page["file_path"], extracted)
-        except Exception as e:
-            logging.warning("Failed to write extracted text sidecar for %s: %s", page["file_path"], e)
-            continue
-        text = artifact.text
-        preview = (text[:800] + "...") if text else ""
-        sidecar = {
-            "keyword": keyword,
-            "source_engine": r.source,
-            "title": r.title,
-            "url": page["url"],
-            "file_path": page["file_path"],
-            "extracted_text_path": artifact.path,
-            "extracted_text_length": artifact.length,
-            "content_type": page.get("content_type", ""),
-            "size": page.get("size", 0),
-            "downloaded_at": datetime.utcnow().isoformat() + "Z",
-            "published_hint": r.published,
-            "text_preview": preview,
-            "version": __VERSION__,
-        }
-        # write sidecar JSON next to file
-        meta_path = page["file_path"] + ".json"
-        try:
-            with open(meta_path, "w", encoding="utf-8") as f:
-                json.dump(sidecar, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-        parsed.append({**page, "meta": sidecar})
+    return parse_pages_with_abstract_fallback(pages, ranked, ranked_by_url, out_dir, keyword)
 
+
+def parse_pages_with_abstract_fallback(pages: List[Dict[str, Any]], ranked: List[SearchResult],
+                                       ranked_by_url: Dict[str, SearchResult], out_dir: str,
+                                       keyword: str) -> List[Dict[str, Any]]:
+    """Parse downloaded pages, then add abstracts for results with no usable page.
+
+    Order matters: the fallback is decided after challenge filtering. A bot wall
+    that downloaded fine is still not the paper, and counting it as downloaded
+    suppressed the abstract of the most relevant source on a run (Jackson et al.
+    2017, behind three different walls, measured 2026-10-24).
+    """
+    parsed = [entry for entry in (_parse_page(page, ranked_by_url, keyword) for page in pages) if entry]
+    abstracts = _pages_from_abstracts(ranked, parsed, out_dir)
+    parsed.extend(entry for entry in (_parse_page(page, ranked_by_url, keyword) for page in abstracts) if entry)
     return parsed
+
+
+def _parse_page(page: Dict[str, Any], ranked_by_url: Dict[str, SearchResult],
+                keyword: str) -> Optional[Dict[str, Any]]:
+    """Extract a downloaded page and write its sidecar, or None if it is unusable."""
+    r = ranked_by_url.get(page["url"])
+    if r is None:
+        logging.warning("Downloaded page has no ranked metadata match: %s", page["url"])
+        return None
+    extracted = parse_any_to_text(page["file_path"]) or ""
+    if local_fetch.is_challenge_text(extracted):
+        # "Checking your browser..." extracts to real characters, so the usual
+        # empty-text guard lets it through and it becomes a cited source.
+        logging.info("Discarding challenge/interstitial page: %s", page["url"])
+        return None
+    try:
+        artifact = persist_canonical_text(page["file_path"], extracted)
+    except Exception as e:
+        logging.warning("Failed to write extracted text sidecar for %s: %s", page["file_path"], e)
+        return None
+    text = artifact.text
+    preview = (text[:800] + "...") if text else ""
+    sidecar = {
+        "keyword": keyword,
+        "source_engine": r.source,
+        "title": r.title,
+        "url": page["url"],
+        "file_path": page["file_path"],
+        "extracted_text_path": artifact.path,
+        "extracted_text_length": artifact.length,
+        "content_type": page.get("content_type", ""),
+        "size": page.get("size", 0),
+        "downloaded_at": datetime.utcnow().isoformat() + "Z",
+        "published_hint": r.published,
+        "text_preview": preview,
+        "version": __VERSION__,
+    }
+    # write sidecar JSON next to file
+    meta_path = page["file_path"] + ".json"
+    try:
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(sidecar, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+    return {**page, "meta": sidecar}
 
 
 MIN_ABSTRACT_CHARS = 240

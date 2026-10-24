@@ -195,8 +195,10 @@ def mmr_rerank(candidates: Sequence[tuple[str, float]], *, lambda_relevance: flo
 
 # Em/en dashes terminate a URL: markdown prose runs them straight onto the last
 # character ("…/2607.15105—far more than…"), and they are never URL characters.
-_URL_PATTERN = re.compile(r"https?://[^\s<>\"'\]\)\u2014\u2013]+")
-_URL_TRAILING = ".,;:!?)*\u2014\u2013'\""
+# So do backticks: reports wrap URLs in inline code, and a trailing "`" made 9 of
+# 11 "off-ledger" citations on one run false positives.
+_URL_PATTERN = re.compile(r"https?://[^\s<>\"'`\]\)\u2014\u2013]+")
+_URL_TRAILING = ".,;:!?)*\u2014\u2013'\"`"
 
 
 def audit_citations(report_text: str, ledger_urls: Iterable[str]) -> dict:
@@ -216,6 +218,56 @@ def audit_citations(report_text: str, ledger_urls: Iterable[str]) -> dict:
         "cited_outside_ledger": outside,
         "ledger_urls_uncited": sorted(ledger - cited),
     }
+
+
+_PAPER_HOSTS = (
+    "doi.org", "arxiv.org", "sciencedirect.com", "springer.com", "nature.com",
+    "science.org", "wiley.com", "pnas.org", "acs.org", "mdpi.com", "plos.org",
+    "frontiersin.org", "ncbi.nlm.nih.gov", "europepmc.org", "biorxiv.org",
+    "tandfonline.com", "sagepub.com", "iop.org", "aps.org", "ieee.org", "acm.org",
+    "annualreviews.org", "cell.com", "oup.com", "cambridge.org",
+)
+
+
+def source_kind(url: str, source_engine: str = "") -> str:
+    """Coarse source type shown to the report writer: paper, institution, or web page.
+
+    The final prompt asks the model to prefer papers; it cannot do that when
+    every claim line looks the same. A label, not a score: nothing is dropped.
+    """
+    if (source_engine or "").startswith("scholarly"):
+        return "paper"
+    host = re.sub(r"^https?://(www\.)?", "", (url or "").lower()).split("/", 1)[0]
+    if any(host == h or host.endswith("." + h) for h in _PAPER_HOSTS):
+        return "paper"
+    if host.endswith(".edu") or host.endswith(".gov") or ".ac." in host or host.endswith(".int"):
+        return "institution"
+    return "web page"
+
+
+def remove_off_ledger_citations(report_text: str, off_ledger: Iterable[str]) -> str:
+    """Drop citations of URLs that were never fetched sources.
+
+    The audit only measured these; they still shipped in the report, including a
+    URL that returned 404 (an invented slug on a real site). A citation the
+    pipeline never read is not evidence, so it is removed: markdown links keep
+    their label, bare URLs and their brackets go, and reference-list entries that
+    held only the URL are dropped.
+    """
+    text = report_text or ""
+    for url in sorted({u for u in off_ledger if u}, key=len, reverse=True):
+        token = re.escape(url) + r"(?![^\s<>\"'`\]\)\u2014\u2013])"
+        text = re.sub(r"\[([^\]]*)\]\(\s*`?" + token + r"`?\s*\)", r"\1", text)
+        text = re.sub(r"`?" + token + r"`?", "\x00", text)
+    if "\x00" not in text:
+        return text
+    # A removed URL inside a list of citations: drop it with its separator.
+    text = re.sub(r"\s*[,;]\s*\x00", "", text)
+    text = re.sub(r"\x00\s*[,;]\s*", "", text)
+    # Brackets left holding nothing, then whole reference lines left empty.
+    text = re.sub(r"\s*[\(\[]\s*\x00\s*[\)\]]", "", text)
+    text = re.sub(r"(?m)^[ \t]*(?:[-*+]|\d+[.)])?[ \t]*(?:\*\*[^*]*\*\*[ \t:]*)?\x00[ \t]*$\n?", "", text)
+    return text.replace("\x00", "")
 
 
 def make_evidence_item(page: dict, meta: dict, branch_query: str, snippet: str) -> EvidenceItem:

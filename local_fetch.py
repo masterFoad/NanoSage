@@ -67,6 +67,13 @@ CHALLENGE_MARKERS = (
     "attention required! | cloudflare",
     "ddos protection by",
     "please verify you are a human",
+    # Anubis proof-of-work wall (university repositories) and the JS/robot
+    # interstitials in front of DOI resolvers and NASA ADS. Measured 2026-10-24:
+    # all three copies of a key paper extracted to one of these and were kept
+    # as "downloaded", which suppressed the paper's abstract.
+    "making sure you're not a bot",
+    "verify that you're not a robot",
+    "verify you're not a robot",
 )
 
 # Below this, whatever came back is a shell, a challenge, or a paywall stub.
@@ -209,7 +216,8 @@ def is_challenge_text(text: str) -> bool:
     if any(marker in head for marker in CHALLENGE_MARKERS):
         return True
     extra = ("cookies must be enabled", "enable cookies for", "recaptcha",
-             "verify you are human", "access denied", "request blocked")
+             "verify you are human", "access denied", "request blocked",
+             "javascript is disabled", "captcha")
     return any(marker in head for marker in extra) and len(text) < 1200
 
 

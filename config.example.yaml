@@ -21,6 +21,7 @@ min_relevance_margin: 0.25       # Keep candidates whose score is within this ma
 parent_relevance_weight: 0.4     # Weight of similarity-to-parent vs similarity-to-root when scoring child branches.
 min_source_relevance: null       # Optional absolute floor for a fetched page's best chunk vs the branch question.
 source_relevance_margin: 0.15    # Keep pages scoring within this margin of the branch's best page. 0 disables gating.
+scholarly_relevance_margin: 0.25 # Wider margin for scholarly abstracts, which score below lay-worded pages. null disables.
 min_sources_per_branch: 2        # Never gate a branch below this many sources.
 min_branches_if_all_pruned: 3    # Force this many top candidates if an absolute floor prunes every branch.
 max_branches: 100

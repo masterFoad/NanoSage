@@ -11,6 +11,11 @@ class LocalFetchTests(unittest.TestCase):
             "Checking your browser before accessing pmc.ncbi.nlm.nih.gov ...",
             "Cookies must be enabled\nEnable cookies for pubmed.ncbi.nlm.nih.gov",
             "Just a moment... please verify you are a human",
+            # Real walls in front of one paper (2026-10-24): Anubis, a DOI resolver, NASA ADS.
+            "# Making sure you're not a bot!\n\nLoading...\n\nYou are seeing this because the administrator",
+            "JavaScript is disabled\nIn order to continue, we need to verify that you're not a robot.",
+            "JavaScript is disabled In order to continue, you need to verify that you're not a robot by "
+            "solving a CAPTCHA puzzle.",
         ):
             self.assertTrue(local_fetch.is_challenge_text(text), text[:40])
 
