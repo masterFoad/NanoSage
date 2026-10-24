@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import math
 import random
+import secrets
+from datetime import datetime, timezone
 from typing import Sequence, TypeVar
 
 T = TypeVar("T")
@@ -47,6 +49,17 @@ def weighted_sample_without_replacement(
         keyed.append((u ** (1.0 / w), idx, item))
     keyed.sort(key=lambda entry: entry[0], reverse=True)
     return [item for _, _, item in keyed[:k]]
+
+
+def unique_run_id(query_key: str, now: datetime | None = None, nonce: str | None = None) -> str:
+    """Per-run directory name: the stable query key plus a UTC timestamp and nonce.
+
+    Two runs of the same query (a rerun, or two A/B arms in parallel) must not
+    share a results directory, or the later report overwrites the earlier one.
+    The seed still comes from the stable key, so reruns stay reproducible.
+    """
+    stamp = (now or datetime.now(timezone.utc)).strftime("%Y%m%dT%H%M%S")
+    return f"{query_key}-{stamp}-{nonce or secrets.token_hex(3)}"
 
 
 def seed_from_query_id(query_id: str) -> int:

@@ -42,6 +42,7 @@ from sampling import (
     choose_frontier_index,
     partition_relative_scores,
     seed_from_query_id,
+    unique_run_id,
 )
 from structured_output import (
     derive_search_terms,
@@ -347,9 +348,10 @@ class SearchSession:
         }
         self.llm_manager = create_llm_manager(**llm_config)
 
-        self.query_id = str(config.get("query_id") or stable_id(self.query, prefix="run"))
+        query_key = stable_id(self.query, prefix="run")
+        self.query_id = str(config.get("query_id") or unique_run_id(query_key))
         configured_seed = self.config.get("seed")
-        self.seed = int(configured_seed) if configured_seed is not None else seed_from_query_id(self.query_id)
+        self.seed = int(configured_seed) if configured_seed is not None else seed_from_query_id(query_key)
         self.rng = random.Random(self.seed)
         self.results_base_dir = self.config.get("results_base_dir", "results")
         self.base_result_dir = str(ensure_dir_under(self.results_base_dir, self.query_id))

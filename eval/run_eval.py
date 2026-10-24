@@ -303,11 +303,11 @@ def run_one(entry: dict, config: Path, results_root: Path, timeout: int) -> dict
         # initialization still tells us exactly which directory is OURS. This is
         # true attempt ownership -- no globbing can confuse it with a directory
         # another process wrote while we ran.
-        match = re.search(r"query_id=(run_[0-9a-f]+)", stdout)
+        match = re.search(r"query_id=(run_[0-9a-f]+(?:-[0-9A-Za-z]+)*)", stdout)
         if match:
             result_dir = results_root / match.group(1)
-    # A run directory is derived deterministically from the query, so a rerun
-    # legitimately reuses it. Directory identity therefore proves nothing; what
+    # Run directories are unique per run now, but an explicit query_id in the
+    # config still reuses one. Directory identity therefore proves nothing; what
     # matters is whether the ARTIFACTS inside it were written by this attempt.
     if result_dir is not None and not _artifacts_are_from_this_attempt(result_dir, artifacts_before):
         result_dir = None
