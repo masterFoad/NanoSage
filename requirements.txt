@@ -2,7 +2,6 @@
 torch
 transformers
 sentence-transformers
-numpy
 pyyaml
 
 # Web and Parsing
@@ -15,10 +14,6 @@ python-dateutil
 pymupdf  # PyMuPDF for PDF handling
 pytesseract
 Pillow   # for image handling
-
-# Optional speed-ups / OCR
-aiohttp-client-cache
-ocrmypdf
 
 # LLM Integration
 ollama
