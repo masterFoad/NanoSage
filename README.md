@@ -6,7 +6,7 @@ Deep Research assistant that runs on your laptop, using tiny models. - all open 
 
 ## How is NanoSage different than other Assistant Researchers?
 
-It offers a structured breakdown of a multi-source, relevance-driven, recursive search pipeline. It walks through how the system refines a user query, builds a knowledge base from local and web data, and dynamically explores subqueries—tracking progress through a Table of Contents (TOC).
+It offers a structured breakdown of a multi-source, relevance-driven, recursive search pipeline. It walks through how the system refines a user query, builds a knowledge base from local and web data, and dynamically explores subqueries, tracking progress through a Table of Contents (TOC).
 
 With Monte Carlo-based exploration, the system balances depth vs. breadth, ranking each branch's relevance to ensure precision and avoid unrelated tangents. The result? A detailed, well-organized report generated using retrieval-augmented generation (RAG), integrating the most valuable insights.
 
@@ -154,11 +154,11 @@ A **detailed Markdown report** will appear in `results/<query_id>/`.
 **Example**:
 ```
 results/
-└── 389380e2/
-    ├── Quantum_computing_in_healthcare_output.md
-    ├── web_Quantum_computing/
-    ├── web_results/
-    └── local_results/
+`-- 389380e2/
+    |-- Quantum_computing_in_healthcare_output.md
+    |-- web_Quantum_computing/
+    |-- web_results/
+    `-- local_results/
 ```
 
 Open the `*_output.md` file (e.g., `Quantum_computing_in_healthcare_output.md`) in a Markdown viewer (VSCode, Obsidian, etc.).
@@ -316,7 +316,7 @@ This approach makes dimension mismatches explicit and uses the right tool for ea
 - **Fallback**: DuckDuckGo, SearxNG, Wikipedia
 - **Sources**: PubMed, academic journals, research databases
 - **Features**: Real-time search, content extraction, metadata generation
-- **Optional**: You.com hosted search (keyless MCP free profile) — enable with
+- **Optional**: You.com hosted search (keyless MCP free profile) - enable with
   `--youcom_search` or `youcom_search: true` in `config.yaml`. No API key is
   required; set `YOUCOM_API_KEY` in `.env` only if you want the authenticated
   profile. Like the other engines, it is fail-open: on error it logs a warning
@@ -374,7 +374,7 @@ This approach makes dimension mismatches explicit and uses the right tool for ea
    - If `< min_relevance`, skip to avoid rabbit holes.
 
 4. **TOCNode Creation**:  
-   - Each subquery → `TOCNode`, storing the text, summary, relevance, etc.
+   - Each subquery -> `TOCNode`, storing the text, summary, relevance, etc.
 
 5. **Web Data**:  
    - If relevant:  
@@ -388,7 +388,7 @@ This approach makes dimension mismatches explicit and uses the right tool for ea
 
 ### 4. Local Retrieval & Summaries
 
-1. **Local Documents** + **Downloaded Web Entries** → appended into `KnowledgeBase`.
+1. **Local Documents** + **Downloaded Web Entries** -> appended into `KnowledgeBase`.
 2. **KnowledgeBase.search(...)** for top-K relevant docs.
 3. Summaries:
    - Summarize web results & local retrieval with `summarize_text()`.
@@ -425,34 +425,34 @@ This approach makes dimension mismatches explicit and uses the right tool for ea
 
 ```plaintext
 User Query
-    │
-    ▼
+    |
+    v
 main.py:
-    └── load_config(config.yaml)
-         └── Create SearchSession(...)
-              │
-              ├── chain_of_thought_query_enhancement()
-              ├── load_retrieval_model()
-              ├── embed_text() for reference
-              ├── load_corpus_from_dir() → KnowledgeBase.add_documents()
-              └── run_session():
-                  └── perform_recursive_web_searches():
-                      ├── For each subquery:
-                      │   ├─ Compute relevance_score
-                      │   ├─ if relevance_score < min_relevance: skip
-                      │   ├─ else:
-                      │   │   ├─ search_and_download() (Tavily API)
-                      │   │   ├─ parse_any_to_text(), embed
-                      │   │   ├─ summarize_text() → store in TOCNode
-                      │   │   └─ if depth < max_depth:
-                      │   │       └─ recursively expand
-                      └── Aggregates web corpus, builds TOC
-              │
-              ├── KnowledgeBase.search(enhanced_query, top_k)
-              ├── Summarize results
-              ├── _build_final_answer() → prompt
-              ├── rag_final_answer() → call_gemma()
-              └── aggregate_results() → saves Markdown
+    `-- load_config(config.yaml)
+         `-- Create SearchSession(...)
+              |
+              |-- chain_of_thought_query_enhancement()
+              |-- load_retrieval_model()
+              |-- embed_text() for reference
+              |-- load_corpus_from_dir() -> KnowledgeBase.add_documents()
+              `-- run_session():
+                  `-- perform_recursive_web_searches():
+                      |-- For each subquery:
+                      |   |- Compute relevance_score
+                      |   |- if relevance_score < min_relevance: skip
+                      |   |- else:
+                      |   |   |- search_and_download() (Tavily API)
+                      |   |   |- parse_any_to_text(), embed
+                      |   |   |- summarize_text() -> store in TOCNode
+                      |   |   `- if depth < max_depth:
+                      |   |       `- recursively expand
+                      `-- Aggregates web corpus, builds TOC
+              |
+              |-- KnowledgeBase.search(enhanced_query, top_k)
+              |-- Summarize results
+              |-- _build_final_answer() -> prompt
+              |-- rag_final_answer() -> call_gemma()
+              `-- aggregate_results() -> saves Markdown
 ```
 
 ---
