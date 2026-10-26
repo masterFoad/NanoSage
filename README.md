@@ -1,5 +1,7 @@
 # 🧙‍♂️ NanoSage: Advanced Recursive Search & Report Generation  
 
+[![tests](https://github.com/masterFoad/NanoSage/actions/workflows/tests.yml/badge.svg)](https://github.com/masterFoad/NanoSage/actions/workflows/tests.yml) [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+
 Deep Research assistant that runs on your laptop, using tiny models. - all open source!
 
 ## How is NanoSage different than other Assistant Researchers?
@@ -14,7 +16,18 @@ Where the table of content is basically its search graph. 🧙
 
 ---
 
-## 📅 Latest Update - October 17, 2025
+## Latest Update - October 2026
+
+> **Deep-search rewrite and more search engines**
+
+- **Evidence-aware deep search**: branches are scored by the evidence they add, coverage is broadened before recursing, and scholarly APIs bring in paper abstracts even when publisher pages are blocked
+- **Grounded reports**: the final report cites only sources that were actually read, and papers stay in the evidence
+- **More search engines, all opt-in and fail-open**: keyless You.com, plus Google results via [Serply](https://serply.io/) or [SearchApi](https://www.searchapi.io/?utm_source=github&utm_medium=sponsorship&utm_campaign=google_search_api&utm_content=masterFoad_NanoSage) when their API key is set; DuckDuckGo now uses `ddgs`
+- **LiteLLM gateway support** for OpenAI-compatible providers, plus run visualization
+- **Reliability**: every run gets its own results directory, and timezone-aware dates no longer crash recency scoring
+- **New example report**: Roman marine concrete (see below)
+
+### Earlier: October 17, 2025
 
 > **Major System Enhancement**: Tavily Integration & Hybrid Embedding Architecture
 
