@@ -457,6 +457,56 @@ class TavilyEngine(BaseEngine):
 
 
 
+class SpecStreamEngine(BaseEngine):
+    """SpecStream Search API - fast and reliable."""
+
+    name = "specstream"
+    endpoint = "https://api.specstream.ai/v1/web-search"
+    
+    def __init__(self, timeout: int = 30):
+        self.api_key = os.getenv("SPECSTREAM_API_KEY")
+        if not self.api_key:
+            raise RuntimeError("SPECSTREAM_API_KEY environment variable not set")
+        self.timeout = timeout
+
+    async def search(self, keyword: str, *, max_results: int = 25) -> List[SearchResult]:
+        # Based on Tavily's expected payload
+        params = {"query": keyword, "max_results": min(max_results, 10)}
+        headers = {"x-api-key": self.api_key, "Accept": "application/json", "User-Agent": "NanoSage"}
+        timeout = aiohttp.ClientTimeout(total=self.timeout)
+        results: List[SearchResult] = []
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                async with session.get(self.endpoint, params=params) as resp:
+                    if resp.status != 200:
+                        logging.warning("SpecStream search HTTP %s", resp.status)
+                        return []
+                    data = await resp.json()
+        except Exception as e:
+            logging.warning("SpecStream search error: %s", e)
+            return []
+        
+        # SpecStream result format
+        items = data.get("results") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            logging.warning("SpecStream search: unexpected response body")
+            return []
+            
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            results.append(SearchResult(
+                title=item.get("title", ""),
+                href=item.get("url", ""),
+                body=item.get("content", ""),
+                source=self.name,
+            ))
+            if len(results) >= max_results:
+                break
+        return results
+
+
+
 class SerplyEngine(BaseEngine):
     """Google results via the Serply API (https://serply.io).
 
@@ -879,6 +929,13 @@ async def search_and_download(keyword: str, out_dir: str = "downloaded_webpages"
             engines.append(TavilyEngine())
         except Exception as e:
             logging.warning("Tavily engine failed: %s", e)
+
+    # 1a) SpecStream Search (requires API key)
+    if os.getenv("SPECSTREAM_API_KEY"):
+        try:
+            engines.append(SpecStreamEngine())
+        except Exception as e:
+            logging.warning("SpecStream engine failed: %s", e)
 
     # 1b) Serply (Google results, requires API key)
     if os.getenv("SERPLY_API_KEY"):
